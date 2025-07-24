@@ -33,13 +33,11 @@ app.post('/api/data', (req, res) => __awaiter(void 0, void 0, void 0, function* 
     if (!mappedData || mappedData.length === 0) {
         return res.status(400).send('No data received');
     }
-    // Get columns and types from the first row
     const firstRow = mappedData[0];
     const columns = Object.keys(firstRow);
-    // Infer types: numbers as NUMERIC, others as TEXT
     const columnDefs = columns.map(col => {
         const value = firstRow[col];
-        const type = typeof value === 'number' ? 'TEXT' : 'TEXT';
+        const type = typeof value === 'number' ? 'TEXT' : 'TEXT'; //mapping all to TEXT for simplicity
         return `"${col}" ${type}`;
     });
     const createTableSQL = `
@@ -50,11 +48,9 @@ app.post('/api/data', (req, res) => __awaiter(void 0, void 0, void 0, function* 
   `;
     try {
         yield pool.query(createTableSQL);
-        // Insert each row
         for (const row of mappedData) {
             const rowColumns = Object.keys(row);
             const values = Object.values(row);
-            // Always quote column names in INSERT
             const colNames = rowColumns.map(col => `"${col}"`).join(', ');
             const paramPlaceholders = rowColumns.map((_, i) => `$${i + 1}`).join(', ');
             const sql = `INSERT INTO mapped_rows (${colNames}) VALUES (${paramPlaceholders})`;

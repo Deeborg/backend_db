@@ -23,14 +23,12 @@ app.post('/api/data', async (req, res) => {
     return res.status(400).send('No data received');
   }
 
-  // Get columns and types from the first row
   const firstRow = mappedData[0];
   const columns = Object.keys(firstRow);
 
-  // Infer types: numbers as NUMERIC, others as TEXT
   const columnDefs = columns.map(col => {
     const value = firstRow[col];
-    const type = typeof value === 'number' ? 'TEXT' : 'TEXT';
+    const type = typeof value === 'number' ? 'TEXT' : 'TEXT'; //mapping all to TEXT for simplicity
     return `"${col}" ${type}`;
   });
 
@@ -43,12 +41,10 @@ app.post('/api/data', async (req, res) => {
   try {
     await pool.query(createTableSQL);
 
-    // Insert each row
     for (const row of mappedData) {
       const rowColumns = Object.keys(row);
       const values = Object.values(row);
 
-      // Always quote column names in INSERT
       const colNames = rowColumns.map(col => `"${col}"`).join(', ');
       const paramPlaceholders = rowColumns.map((_, i) => `$${i + 1}`).join(', ');
 
