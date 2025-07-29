@@ -29,34 +29,70 @@ const pool = new pg_1.Pool({
     port: 5432,
 });
 app.post('/api/data', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const { mappedData } = req.body;
+    const { mappedData } = req.body; // define type for mappedData
     if (!mappedData || mappedData.length === 0) {
         return res.status(400).send('No data received');
     }
-    const firstRow = mappedData[0];
-    const columns = Object.keys(firstRow);
-    const columnDefs = columns.map(col => {
-        const value = firstRow[col];
-        const type = typeof value === 'number' ? 'TEXT' : 'TEXT'; //mapping all to TEXT for simplicity
-        return `"${col}" ${type}`;
+    const exclude = ['createdby', 'accountType', 'Level 1 Desc', 'Level 2 Desc', 'functionalArea'];
+    // 1️⃣ Create transformed data with proper typing
+    const transformedData = mappedData.map((row) => {
+        const newRow = {};
+        Object.keys(row).forEach((key) => {
+            if (!exclude.includes(key)) {
+                if (key === 'glAccount') {
+                    newRow[key] = row[key]; // Keep glAccount value
+                }
+                else {
+                    newRow[key] = 0; // Set other fields to 0
+                }
+            }
+        });
+        return newRow;
     });
-    const createTableSQL = `
-    CREATE TABLE IF NOT EXISTS mapped_rows (
-      id SERIAL PRIMARY KEY,
-      ${columnDefs.join(',\n      ')}
-    );
-  `;
     try {
-        yield pool.query(createTableSQL);
+        // ==================================
+        // Insert Original mappedData
+        // ==================================
+        const firstRowOriginal = mappedData[0];
+        const originalColumns = Object.keys(firstRowOriginal);
+        const originalColumnDefs = originalColumns.map(col => `"${col}" TEXT`);
+        const createOriginalTableSQL = `
+      CREATE TABLE IF NOT EXISTS trial_balance (
+        id SERIAL PRIMARY KEY,
+        ${originalColumnDefs.join(',\n      ')}
+      );
+    `;
+        yield pool.query(createOriginalTableSQL);
         for (const row of mappedData) {
             const rowColumns = Object.keys(row);
             const values = Object.values(row);
             const colNames = rowColumns.map(col => `"${col}"`).join(', ');
             const paramPlaceholders = rowColumns.map((_, i) => `$${i + 1}`).join(', ');
-            const sql = `INSERT INTO mapped_rows (${colNames}) VALUES (${paramPlaceholders})`;
+            const sql = `INSERT INTO trial_balance (${colNames}) VALUES (${paramPlaceholders})`;
             yield pool.query(sql, values);
         }
-        res.status(200).send('Data inserted');
+        // ==================================
+        // Insert Transformed mappedData
+        // ==================================
+        const firstRowTransformed = transformedData[0];
+        const transformedColumns = Object.keys(firstRowTransformed);
+        const transformedColumnDefs = transformedColumns.map(col => `"${col}" TEXT`);
+        const createTransformedTableSQL = `
+      CREATE TABLE IF NOT EXISTS adjustment_entries (
+        id SERIAL PRIMARY KEY,
+        ${transformedColumnDefs.join(',\n      ')}
+      );
+    `;
+        yield pool.query(createTransformedTableSQL);
+        for (const row of transformedData) {
+            const rowColumns = Object.keys(row);
+            const values = Object.values(row);
+            const colNames = rowColumns.map(col => `"${col}"`).join(', ');
+            const paramPlaceholders = rowColumns.map((_, i) => `$${i + 1}`).join(', ');
+            const sql = `INSERT INTO adjustment_entries (${colNames}) VALUES (${paramPlaceholders})`;
+            yield pool.query(sql, values);
+        }
+        res.status(200).send('Both mappedData and transformedData inserted successfully');
     }
     catch (error) {
         console.error(error);
