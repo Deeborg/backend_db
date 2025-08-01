@@ -44,7 +44,11 @@ app.post('/api/data', async (req, res) => {
     const newRow: Record<string, any> = {};
     Object.keys(row).forEach((key) => {
       if (!exclude.includes(key)) {
-        newRow[key] = key === 'glAccount' ? row[key] : 0;
+        if (key === 'glAccount' || key === 'glName') {
+          newRow[key] = row[key];
+        } else {
+          newRow[key] = 0;
+        }
       }
     });
     return newRow;
@@ -107,15 +111,15 @@ app.post('/api/data', async (req, res) => {
 app.get('/api/journal/metadata', async (req, res) => {
   try {
     const glAccountsResult = await pool.query(
-      `SELECT DISTINCT "glAccount" FROM ${TABLE_NAME} ORDER BY "glAccount"`
+      `SELECT DISTINCT "glAccount", "glName" FROM ${TABLE_NAME} ORDER BY "glAccount"`
     );
-    const glAccounts = glAccountsResult.rows.map(row => row.glAccount);
+    const glAccounts = glAccountsResult.rows;
 
     const columnsResult = await pool.query(
       `
       SELECT column_name 
       FROM information_schema.columns 
-      WHERE table_name = $1 AND column_name != 'glAccount'
+      WHERE table_name = $1 AND column_name NOT IN ('glAccount', 'glName')
       `,
       [TABLE_NAME]
     );
@@ -128,30 +132,76 @@ app.get('/api/journal/metadata', async (req, res) => {
   }
 });
 
-/**
- * @route POST /api/journal/update
- * @desc  Update a specific cell in the journal table
- */
-app.post('/api/journal/update', async (req, res) => {
-  const { glAccount, period, value } = req.body;
+// /**
+//  * @route POST /api/journal/update
+//  * @desc  Update a specific cell in the journal table
+//  */
+// app.post('/api/journal/update', async (req, res) => {
+//   const { glAccount, period, value } = req.body;
 
-  if (!glAccount || !period || value === undefined) {
-    return res.status(400).json({ msg: 'Please provide glAccount, period, and value' });
+//   if (!glAccount || !period || value === undefined) {
+//     return res.status(400).json({ msg: 'Please provide glAccount, period, and value' });
+//   }
+
+//   try {
+//     const updateQuery = `
+//       UPDATE ${TABLE_NAME} 
+//       SET "${period}" = $1 
+//       WHERE "glAccount" = $2
+//     `;
+//     await pool.query(updateQuery, [value, glAccount]);
+//     res.json({ msg: 'Journal entry updated successfully' });
+//   } catch (err: any) {
+//     console.error(err.message);
+//     res.status(500).send('Server Error');
+//   }
+// });
+
+/**
+ * @route   POST /api/journal/batch-update
+ * @desc    Updates multiple journal entries in a single transaction
+ */
+app.post('/api/journal/batch-update', async (req, res) => {
+  const entries = req.body; // Expects an array: [{ glAccount, period, value }, ...]
+
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return res.status(400).json({ msg: 'Invalid request body. Expected an array of entries.' });
   }
+
+  const client = await pool.connect(); // Get a client from the pool for transaction
 
   try {
-    const updateQuery = `
-      UPDATE ${TABLE_NAME} 
-      SET "${period}" = $1 
-      WHERE "glAccount" = $2
-    `;
-    await pool.query(updateQuery, [value, glAccount]);
-    res.json({ msg: 'Journal entry updated successfully' });
+    await client.query('BEGIN'); // Start transaction
+
+    // Use Promise.all to run all update queries concurrently
+    const updatePromises = entries.map(entry => {
+      const { glAccount, period, value } = entry;
+      const updateQuery = `
+        UPDATE ${TABLE_NAME} 
+        SET "${period}" = $1 
+        WHERE "glAccount" = $2
+      `;
+      // Ensure values are valid before querying
+      if (glAccount && period && value !== undefined) {
+         return client.query(updateQuery, [value, glAccount]);
+      }
+      return Promise.resolve(); // Ignore invalid entries
+    });
+
+    await Promise.all(updatePromises);
+    
+    await client.query('COMMIT'); // Commit transaction if all updates succeed
+    res.json({ msg: 'Journal entries posted successfully' });
+
   } catch (err: any) {
-    console.error(err.message);
-    res.status(500).send('Server Error');
+    await client.query('ROLLBACK'); // Rollback transaction on any error
+    console.error('Transaction failed:', err.message);
+    res.status(500).send('Server Error during transaction');
+  } finally {
+    client.release(); // IMPORTANT: Release the client back to the pool
   }
 });
+
 
 // Start server
 app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));

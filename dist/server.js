@@ -49,7 +49,12 @@ app.post('/api/data', (req, res) => __awaiter(void 0, void 0, void 0, function* 
         const newRow = {};
         Object.keys(row).forEach((key) => {
             if (!exclude.includes(key)) {
-                newRow[key] = key === 'glAccount' ? row[key] : 0;
+                if (key === 'glAccount' || key === 'glName') {
+                    newRow[key] = row[key];
+                }
+                else {
+                    newRow[key] = 0;
+                }
             }
         });
         return newRow;
@@ -106,12 +111,12 @@ app.post('/api/data', (req, res) => __awaiter(void 0, void 0, void 0, function* 
  */
 app.get('/api/journal/metadata', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
-        const glAccountsResult = yield pool.query(`SELECT DISTINCT "glAccount" FROM ${TABLE_NAME} ORDER BY "glAccount"`);
-        const glAccounts = glAccountsResult.rows.map(row => row.glAccount);
+        const glAccountsResult = yield pool.query(`SELECT DISTINCT "glAccount", "glName" FROM ${TABLE_NAME} ORDER BY "glAccount"`);
+        const glAccounts = glAccountsResult.rows;
         const columnsResult = yield pool.query(`
       SELECT column_name 
       FROM information_schema.columns 
-      WHERE table_name = $1 AND column_name != 'glAccount'
+      WHERE table_name = $1 AND column_name NOT IN ('glAccount', 'glName')
       `, [TABLE_NAME]);
         const periods = columnsResult.rows.map(row => row.column_name);
         res.json({ glAccounts, periods });
@@ -121,27 +126,65 @@ app.get('/api/journal/metadata', (req, res) => __awaiter(void 0, void 0, void 0,
         res.status(500).send('Server Error');
     }
 }));
+// /**
+//  * @route POST /api/journal/update
+//  * @desc  Update a specific cell in the journal table
+//  */
+// app.post('/api/journal/update', async (req, res) => {
+//   const { glAccount, period, value } = req.body;
+//   if (!glAccount || !period || value === undefined) {
+//     return res.status(400).json({ msg: 'Please provide glAccount, period, and value' });
+//   }
+//   try {
+//     const updateQuery = `
+//       UPDATE ${TABLE_NAME} 
+//       SET "${period}" = $1 
+//       WHERE "glAccount" = $2
+//     `;
+//     await pool.query(updateQuery, [value, glAccount]);
+//     res.json({ msg: 'Journal entry updated successfully' });
+//   } catch (err: any) {
+//     console.error(err.message);
+//     res.status(500).send('Server Error');
+//   }
+// });
 /**
- * @route POST /api/journal/update
- * @desc  Update a specific cell in the journal table
+ * @route   POST /api/journal/batch-update
+ * @desc    Updates multiple journal entries in a single transaction
  */
-app.post('/api/journal/update', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const { glAccount, period, value } = req.body;
-    if (!glAccount || !period || value === undefined) {
-        return res.status(400).json({ msg: 'Please provide glAccount, period, and value' });
+app.post('/api/journal/batch-update', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const entries = req.body; // Expects an array: [{ glAccount, period, value }, ...]
+    if (!Array.isArray(entries) || entries.length === 0) {
+        return res.status(400).json({ msg: 'Invalid request body. Expected an array of entries.' });
     }
+    const client = yield pool.connect(); // Get a client from the pool for transaction
     try {
-        const updateQuery = `
-      UPDATE ${TABLE_NAME} 
-      SET "${period}" = $1 
-      WHERE "glAccount" = $2
-    `;
-        yield pool.query(updateQuery, [value, glAccount]);
-        res.json({ msg: 'Journal entry updated successfully' });
+        yield client.query('BEGIN'); // Start transaction
+        // Use Promise.all to run all update queries concurrently
+        const updatePromises = entries.map(entry => {
+            const { glAccount, period, value } = entry;
+            const updateQuery = `
+        UPDATE ${TABLE_NAME} 
+        SET "${period}" = $1 
+        WHERE "glAccount" = $2
+      `;
+            // Ensure values are valid before querying
+            if (glAccount && period && value !== undefined) {
+                return client.query(updateQuery, [value, glAccount]);
+            }
+            return Promise.resolve(); // Ignore invalid entries
+        });
+        yield Promise.all(updatePromises);
+        yield client.query('COMMIT'); // Commit transaction if all updates succeed
+        res.json({ msg: 'Journal entries posted successfully' });
     }
     catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
+        yield client.query('ROLLBACK'); // Rollback transaction on any error
+        console.error('Transaction failed:', err.message);
+        res.status(500).send('Server Error during transaction');
+    }
+    finally {
+        client.release(); // IMPORTANT: Release the client back to the pool
     }
 }));
 // Start server
