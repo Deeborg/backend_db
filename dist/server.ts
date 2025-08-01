@@ -24,11 +24,70 @@ const pool = new Pool({
 });
 
 // --- TABLE NAME for journal update APIs ---
-const TABLE_NAME = process.env.JOURNAL_TABLE || 'adjustment_entries'; 
+const TABLE_NAME = process.env.JOURNAL_TABLE || 'adjustment_entries';
+
+/**
+ * Ensures that a table exists with "glAccount" as primary key
+ */
+async function ensureTable(tableName: string, sampleRow: Record<string, any>) {
+  const existingColumnsResult = await pool.query(
+    `SELECT column_name FROM information_schema.columns WHERE table_name = $1`,
+    [tableName]
+  );
+  const existingColumns = existingColumnsResult.rows.map(r => r.column_name);
+
+  // Create table if it doesn't exist
+  if (existingColumns.length === 0) {
+    const columnDefs = Object.keys(sampleRow)
+      .filter(col => col !== 'glAccount')
+      .map(col => `"${col}" TEXT`);
+
+    const createTableSQL = `
+      CREATE TABLE IF NOT EXISTS ${tableName} (
+        "glAccount" TEXT PRIMARY KEY,
+        ${columnDefs.join(',\n        ')}
+      );
+    `;
+    await pool.query(createTableSQL);
+  } else {
+    // Add any missing columns dynamically
+    for (const col of Object.keys(sampleRow)) {
+      if (!existingColumns.includes(col)) {
+        await pool.query(`ALTER TABLE ${tableName} ADD COLUMN "${col}" TEXT`);
+      }
+    }
+  }
+}
+
+/**
+ * Inserts or updates rows using ON CONFLICT (upsert)
+ */
+async function upsertRows(tableName: string, rows: Record<string, any>[]) {
+  for (const row of rows) {
+    const columns = Object.keys(row);
+    const values = Object.values(row);
+
+    const colNames = columns.map(col => `"${col}"`).join(', ');
+    const paramPlaceholders = columns.map((_, i) => `$${i + 1}`).join(', ');
+
+    const updateAssignments = columns
+      .filter(col => col !== 'glAccount')
+      .map(col => `"${col}" = EXCLUDED."${col}"`)
+      .join(', ');
+
+    const sql = `
+      INSERT INTO ${tableName} (${colNames})
+      VALUES (${paramPlaceholders})
+      ON CONFLICT ("glAccount")
+      DO UPDATE SET ${updateAssignments};
+    `;
+    await pool.query(sql, values);
+  }
+}
 
 /**
  * @route POST /api/data
- * @desc  Insert mappedData and transformedData into PostgreSQL
+ * @desc  Insert mappedData and transformedData into PostgreSQL with upsert
  */
 app.post('/api/data', async (req, res) => {
   const { mappedData } = req.body as { mappedData: Record<string, any>[] };
@@ -55,52 +114,18 @@ app.post('/api/data', async (req, res) => {
   });
 
   try {
-    // 1. Create and insert into trial_balance
-    const firstRowOriginal = mappedData[0];
-    const originalColumns = Object.keys(firstRowOriginal);
-    const originalColumnDefs = originalColumns.map(col => `"${col}" TEXT`);
-    const createOriginalTableSQL = `
-      CREATE TABLE IF NOT EXISTS trial_balance (
-        id SERIAL PRIMARY KEY,
-        ${originalColumnDefs.join(',\n      ')}
-      );
-    `;
-    await pool.query(createOriginalTableSQL);
+    // Ensure tables exist and have correct structure
+    await ensureTable('trial_balance', mappedData[0]);
+    await ensureTable('adjustment_entries', transformedData[0]);
 
-    for (const row of mappedData) {
-      const rowColumns = Object.keys(row);
-      const values = Object.values(row);
-      const colNames = rowColumns.map(col => `"${col}"`).join(', ');
-      const paramPlaceholders = rowColumns.map((_, i) => `$${i + 1}`).join(', ');
-      const sql = `INSERT INTO trial_balance (${colNames}) VALUES (${paramPlaceholders})`;
-      await pool.query(sql, values);
-    }
+    // Insert or update data
+    await upsertRows('trial_balance', mappedData);
+    await upsertRows('adjustment_entries', transformedData);
 
-    // 2. Create and insert into adjustment_entries
-    const firstRowTransformed = transformedData[0];
-    const transformedColumns = Object.keys(firstRowTransformed);
-    const transformedColumnDefs = transformedColumns.map(col => `"${col}" TEXT`);
-    const createTransformedTableSQL = `
-      CREATE TABLE IF NOT EXISTS adjustment_entries (
-        id SERIAL PRIMARY KEY,
-        ${transformedColumnDefs.join(',\n      ')}
-      );
-    `;
-    await pool.query(createTransformedTableSQL);
-
-    for (const row of transformedData) {
-      const rowColumns = Object.keys(row);
-      const values = Object.values(row);
-      const colNames = rowColumns.map(col => `"${col}"`).join(', ');
-      const paramPlaceholders = rowColumns.map((_, i) => `$${i + 1}`).join(', ');
-      const sql = `INSERT INTO adjustment_entries (${colNames}) VALUES (${paramPlaceholders})`;
-      await pool.query(sql, values);
-    }
-
-    res.status(200).send('Both mappedData and transformedData inserted successfully');
+    res.status(200).send('Both mappedData and transformedData inserted/updated successfully');
   } catch (error) {
     console.error(error);
-    res.status(500).send('Error inserting data');
+    res.status(500).send('Error inserting/updating data');
   }
 });
 
@@ -132,34 +157,9 @@ app.get('/api/journal/metadata', async (req, res) => {
   }
 });
 
-// /**
-//  * @route POST /api/journal/update
-//  * @desc  Update a specific cell in the journal table
-//  */
-// app.post('/api/journal/update', async (req, res) => {
-//   const { glAccount, period, value } = req.body;
-
-//   if (!glAccount || !period || value === undefined) {
-//     return res.status(400).json({ msg: 'Please provide glAccount, period, and value' });
-//   }
-
-//   try {
-//     const updateQuery = `
-//       UPDATE ${TABLE_NAME} 
-//       SET "${period}" = $1 
-//       WHERE "glAccount" = $2
-//     `;
-//     await pool.query(updateQuery, [value, glAccount]);
-//     res.json({ msg: 'Journal entry updated successfully' });
-//   } catch (err: any) {
-//     console.error(err.message);
-//     res.status(500).send('Server Error');
-//   }
-// });
-
 /**
- * @route   POST /api/journal/batch-update
- * @desc    Updates multiple journal entries in a single transaction
+ * @route POST /api/journal/batch-update
+ * @desc Updates multiple journal entries in a single transaction
  */
 app.post('/api/journal/batch-update', async (req, res) => {
   const entries = req.body; // Expects an array: [{ glAccount, period, value }, ...]
@@ -168,12 +168,11 @@ app.post('/api/journal/batch-update', async (req, res) => {
     return res.status(400).json({ msg: 'Invalid request body. Expected an array of entries.' });
   }
 
-  const client = await pool.connect(); // Get a client from the pool for transaction
+  const client = await pool.connect();
 
   try {
-    await client.query('BEGIN'); // Start transaction
+    await client.query('BEGIN');
 
-    // Use Promise.all to run all update queries concurrently
     const updatePromises = entries.map(entry => {
       const { glAccount, period, value } = entry;
       const updateQuery = `
@@ -181,27 +180,24 @@ app.post('/api/journal/batch-update', async (req, res) => {
         SET "${period}" = $1 
         WHERE "glAccount" = $2
       `;
-      // Ensure values are valid before querying
       if (glAccount && period && value !== undefined) {
-         return client.query(updateQuery, [value, glAccount]);
+        return client.query(updateQuery, [value, glAccount]);
       }
-      return Promise.resolve(); // Ignore invalid entries
+      return Promise.resolve();
     });
 
     await Promise.all(updatePromises);
-    
-    await client.query('COMMIT'); // Commit transaction if all updates succeed
-    res.json({ msg: 'Journal entries posted successfully' });
 
+    await client.query('COMMIT');
+    res.json({ msg: 'Journal entries posted successfully' });
   } catch (err: any) {
-    await client.query('ROLLBACK'); // Rollback transaction on any error
+    await client.query('ROLLBACK');
     console.error('Transaction failed:', err.message);
     res.status(500).send('Server Error during transaction');
   } finally {
-    client.release(); // IMPORTANT: Release the client back to the pool
+    client.release();
   }
 });
-
 
 // Start server
 app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
