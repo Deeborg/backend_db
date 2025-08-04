@@ -237,7 +237,7 @@ app.get('/api/journal/updated', (req, res) => __awaiter(void 0, void 0, void 0, 
 }));
 app.get('/api/financial_variables', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
-        const glAccountsupdated = yield pool.query('SELECT * FROM financial_variables');
+        const glAccountsupdated = yield pool.query('SELECT * FROM financial_variables1');
         const updatedglAccounts = glAccountsupdated.rows; // Get all rows directly
         res.json(updatedglAccounts); // Send all data as JSON
     }

@@ -260,7 +260,7 @@ app.get('/api/journal/updated', async (req, res) => {
 
 app.get('/api/financial_variables', async (req, res) => {
     try {
-        const glAccountsupdated = await pool.query('SELECT * FROM financial_variables');
+        const glAccountsupdated = await pool.query('SELECT * FROM financial_variables1');
         const updatedglAccounts = glAccountsupdated.rows; // Get all rows directly
         res.json(updatedglAccounts); // Send all data as JSON
     } catch (err:any) {
