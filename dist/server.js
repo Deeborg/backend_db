@@ -29,7 +29,7 @@ const pool = new pg_1.Pool({
     user: process.env.DB_USER || 'postgres',
     host: process.env.DB_HOST || 'localhost',
     database: process.env.DB_DATABASE || 'Y_Finance',
-    password: process.env.DB_PASSWORD || 'password1A',
+    password: process.env.DB_PASSWORD || 'root',
     port: Number(process.env.DB_PORT) || 5432,
 });
 // --- TABLE NAME for journal update APIs ---
@@ -41,14 +41,16 @@ function ensureTable(tableName, sampleRow) {
     return __awaiter(this, void 0, void 0, function* () {
         const existingColumnsResult = yield pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name = $1`, [tableName]);
         const existingColumns = existingColumnsResult.rows.map(r => r.column_name);
+        // Determine primary key column
+        const primaryKey = tableName === 'financial_variables1' ? 'key' : 'glAccount';
         // Create table if it doesn't exist
         if (existingColumns.length === 0) {
             const columnDefs = Object.keys(sampleRow)
-                .filter(col => col !== 'glAccount')
+                .filter(col => col !== primaryKey)
                 .map(col => `"${col}" TEXT`);
             const createTableSQL = `
-      CREATE TABLE IF NOT EXISTS ${tableName} (
-        "glAccount" TEXT PRIMARY KEY,
+      CREATE TABLE IF NOT EXISTS "${tableName}" (
+        "${primaryKey}" TEXT PRIMARY KEY,
         ${columnDefs.join(',\n        ')}
       );
     `;
@@ -58,7 +60,7 @@ function ensureTable(tableName, sampleRow) {
             // Add any missing columns dynamically
             for (const col of Object.keys(sampleRow)) {
                 if (!existingColumns.includes(col)) {
-                    yield pool.query(`ALTER TABLE ${tableName} ADD COLUMN "${col}" TEXT`);
+                    yield pool.query(`ALTER TABLE "${tableName}" ADD COLUMN "${col}" TEXT`);
                 }
             }
         }
@@ -85,6 +87,27 @@ function upsertRows(tableName, rows) {
       DO UPDATE SET ${updateAssignments};
     `;
             yield pool.query(sql, values);
+        }
+    });
+}
+function upsertRowsWithKey(tableName, rows) {
+    return __awaiter(this, void 0, void 0, function* () {
+        for (const row of rows) {
+            const columns = Object.keys(row);
+            const values = Object.values(row);
+            const colNames = columns.map(col => `"${col}"`).join(', ');
+            const paramPlaceholders = columns.map((_, i) => `$${i + 1}`).join(', ');
+            const updateAssignments = columns
+                .filter(col => col !== 'key')
+                .map(col => `"${col}" = EXCLUDED."${col}"`)
+                .join(', ');
+            const sql = `
+      INSERT INTO ${tableName} (${colNames})
+      VALUES (${paramPlaceholders})
+      ON CONFLICT ("key")
+      DO UPDATE SET ${updateAssignments};
+    `;
+            yield pool.query(sql, values); // ✅ CORRECT
         }
     });
 }
@@ -121,6 +144,22 @@ app.post('/api/data', (req, res) => __awaiter(void 0, void 0, void 0, function* 
         yield upsertRows('trial_balance', mappedData);
         yield upsertRows('adjustment_entries', transformedData);
         res.status(200).send('Both mappedData and transformedData inserted/updated successfully');
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).send('Error inserting/updating data');
+    }
+}));
+app.post('/api/financialvar-updated', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const { financialVar1 } = req.body;
+    if (!financialVar1 || financialVar1.length === 0) {
+        return res.status(400).send('No data received');
+    }
+    try {
+        // Ensure tables exist and have correct structure
+        yield ensureTable('financial_variables1', financialVar1[0]);
+        yield upsertRowsWithKey('financial_variables1', financialVar1);
+        res.status(200).send('financialVar inserted/updated successfully');
     }
     catch (error) {
         console.error(error);
@@ -183,6 +222,28 @@ app.post('/api/journal/batch-update', (req, res) => __awaiter(void 0, void 0, vo
     }
     finally {
         client.release();
+    }
+}));
+app.get('/api/journal/updated', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const glAccountsupdated = yield pool.query('SELECT * FROM adjustment_entries');
+        const updatedglAccounts = glAccountsupdated.rows; // Get all rows directly
+        res.json(updatedglAccounts); // Send all data as JSON
+    }
+    catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+}));
+app.get('/api/financial_variables', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const glAccountsupdated = yield pool.query('SELECT * FROM financial_variables');
+        const updatedglAccounts = glAccountsupdated.rows; // Get all rows directly
+        res.json(updatedglAccounts); // Send all data as JSON
+    }
+    catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
     }
 }));
 // Start server

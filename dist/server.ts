@@ -19,7 +19,7 @@ const pool = new Pool({
   user: process.env.DB_USER || 'postgres',
   host: process.env.DB_HOST || 'localhost',
   database: process.env.DB_DATABASE || 'Y_Finance',
-  password: process.env.DB_PASSWORD || 'password1A',
+  password: process.env.DB_PASSWORD || 'root',
   port: Number(process.env.DB_PORT) || 5432,
 });
 
@@ -36,15 +36,18 @@ async function ensureTable(tableName: string, sampleRow: Record<string, any>) {
   );
   const existingColumns = existingColumnsResult.rows.map(r => r.column_name);
 
+  // Determine primary key column
+  const primaryKey = tableName === 'financial_variables1' ? 'key' : 'glAccount';
+
   // Create table if it doesn't exist
   if (existingColumns.length === 0) {
     const columnDefs = Object.keys(sampleRow)
-      .filter(col => col !== 'glAccount')
+      .filter(col => col !== primaryKey)
       .map(col => `"${col}" TEXT`);
 
     const createTableSQL = `
-      CREATE TABLE IF NOT EXISTS ${tableName} (
-        "glAccount" TEXT PRIMARY KEY,
+      CREATE TABLE IF NOT EXISTS "${tableName}" (
+        "${primaryKey}" TEXT PRIMARY KEY,
         ${columnDefs.join(',\n        ')}
       );
     `;
@@ -53,11 +56,12 @@ async function ensureTable(tableName: string, sampleRow: Record<string, any>) {
     // Add any missing columns dynamically
     for (const col of Object.keys(sampleRow)) {
       if (!existingColumns.includes(col)) {
-        await pool.query(`ALTER TABLE ${tableName} ADD COLUMN "${col}" TEXT`);
+        await pool.query(`ALTER TABLE "${tableName}" ADD COLUMN "${col}" TEXT`);
       }
     }
   }
 }
+
 
 /**
  * Inserts or updates rows using ON CONFLICT (upsert)
@@ -82,6 +86,30 @@ async function upsertRows(tableName: string, rows: Record<string, any>[]) {
       DO UPDATE SET ${updateAssignments};
     `;
     await pool.query(sql, values);
+  }
+}
+
+async function upsertRowsWithKey(tableName: string, rows: Record<string, any>[]) {
+  for (const row of rows) {
+    const columns = Object.keys(row);
+    const values = Object.values(row);
+
+    const colNames = columns.map(col => `"${col}"`).join(', ');
+    const paramPlaceholders = columns.map((_, i) => `$${i + 1}`).join(', ');
+
+    const updateAssignments = columns
+      .filter(col => col !== 'key')
+      .map(col => `"${col}" = EXCLUDED."${col}"`)
+      .join(', ');
+
+    const sql = `
+      INSERT INTO ${tableName} (${colNames})
+      VALUES (${paramPlaceholders})
+      ON CONFLICT ("key")
+      DO UPDATE SET ${updateAssignments};
+    `;
+
+    await pool.query(sql, values); // ✅ CORRECT
   }
 }
 
@@ -123,6 +151,26 @@ app.post('/api/data', async (req, res) => {
     await upsertRows('adjustment_entries', transformedData);
 
     res.status(200).send('Both mappedData and transformedData inserted/updated successfully');
+  } catch (error) {
+    console.error(error);
+    res.status(500).send('Error inserting/updating data');
+  }
+});
+
+app.post('/api/financialvar-updated', async (req, res) => {
+  const { financialVar1 } = req.body as { financialVar1: Record<string, any>[] };
+
+  if (!financialVar1 || financialVar1.length === 0) {
+    return res.status(400).send('No data received');
+  }
+  try {
+    // Ensure tables exist and have correct structure
+    await ensureTable('financial_variables1', financialVar1[0]);
+    
+    
+    await upsertRowsWithKey('financial_variables1', financialVar1);
+
+    res.status(200).send('financialVar inserted/updated successfully');
   } catch (error) {
     console.error(error);
     res.status(500).send('Error inserting/updating data');
@@ -198,6 +246,29 @@ app.post('/api/journal/batch-update', async (req, res) => {
     client.release();
   }
 });
+
+app.get('/api/journal/updated', async (req, res) => {
+    try {
+        const glAccountsupdated = await pool.query('SELECT * FROM adjustment_entries');
+        const updatedglAccounts = glAccountsupdated.rows; // Get all rows directly
+        res.json(updatedglAccounts); // Send all data as JSON
+    } catch (err:any) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+});
+
+app.get('/api/financial_variables', async (req, res) => {
+    try {
+        const glAccountsupdated = await pool.query('SELECT * FROM financial_variables');
+        const updatedglAccounts = glAccountsupdated.rows; // Get all rows directly
+        res.json(updatedglAccounts); // Send all data as JSON
+    } catch (err:any) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+});
+
 
 // Start server
 app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
