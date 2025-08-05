@@ -367,8 +367,22 @@ app.get('/api/trial-balance/data', async (req, res) => {
  */
 app.get('/api/financial-variables', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM financial_variables1');
-    res.json(result.rows);
+    // Check if the table exists first
+    const tableExists = await pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_name = 'financial_variables1'
+      );
+    `);
+    
+    if (tableExists.rows[0].exists) {
+      const result = await pool.query('SELECT * FROM financial_variables1');
+      res.json(result.rows);
+    } else {
+      // Return empty array if table doesn't exist
+      console.log('financial_variables1 table does not exist, returning empty array');
+      res.json([]);
+    }
   } catch (err: any) {
     console.error(err.message);
     res.status(500).send('Server Error');
@@ -376,4 +390,4 @@ app.get('/api/financial-variables', async (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`)); 
