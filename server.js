@@ -8,17 +8,6 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
-var __rest = (this && this.__rest) || function (s, e) {
-    var t = {};
-    for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p) && e.indexOf(p) < 0)
-        t[p] = s[p];
-    if (s != null && typeof Object.getOwnPropertySymbols === "function")
-        for (var i = 0, p = Object.getOwnPropertySymbols(s); i < p.length; i++) {
-            if (e.indexOf(p[i]) < 0 && Object.prototype.propertyIsEnumerable.call(s, p[i]))
-                t[p[i]] = s[p[i]];
-        }
-    return t;
-};
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -41,7 +30,7 @@ const pool = new pg_1.Pool({
     user: process.env.DB_USER || 'postgres',
     host: process.env.DB_HOST || 'localhost',
     database: process.env.DB_DATABASE || 'Y_Finance',
-    password: process.env.DB_PASSWORD || 'root',
+    password: process.env.DB_PASSWORD || 'password1A',
     port: Number(process.env.DB_PORT) || 5432,
 });
 // --- TABLE NAME for journal update APIs ---
@@ -130,7 +119,7 @@ function upsertRowsWithKey(tableName, rows) {
             const paramPlaceholders = columns.map((_, i) => `$${i + 1}`).join(', ');
             const updateAssignments = columns
                 .filter(col => col !== 'key')
-                .map(col => `"${col}" = COALESCE(${tableName}."${col}", EXCLUDED."${col}")`)
+                .map(col => `"${col}" = EXCLUDED."${col}"`)
                 .join(', ');
             const sql = `
       INSERT INTO ${tableName} (${colNames})
@@ -289,42 +278,6 @@ app.get('/api/journal/updated', (req, res) => __awaiter(void 0, void 0, void 0, 
         res.status(500).send('Server Error');
     }
 }));
-app.post('/update-financial-vars', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    try {
-        const dataArray = Array.isArray(req.body) ? req.body : [req.body];
-        for (const row of dataArray) {
-            const { key } = row, columnsToUpdate = __rest(row, ["key"]);
-            if (!key || Object.keys(columnsToUpdate).length === 0)
-                continue;
-            const setClauses = Object.keys(columnsToUpdate)
-                .map((col, i) => `"${col}" = $${i + 2}`)
-                .join(', ');
-            const values = [key, ...Object.values(columnsToUpdate)];
-            const query = `
-        UPDATE financial_variables1
-        SET ${setClauses}
-        WHERE key = $1
-      `;
-            yield pool.query(query, values);
-        }
-        res.status(200).json({ message: 'Update successful' });
-    }
-    catch (error) {
-        console.error('Error updating:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-}));
-app.get('/api/financial_variables', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    try {
-        const updatedFinancialVariables = yield pool.query('SELECT * FROM financial_variables');
-        const updatedglFinancials = updatedFinancialVariables.rows; // Get all rows directly
-        res.json(updatedglFinancials); // Send all data as JSON
-    }
-    catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
-    }
-}));
 /**
  * @route GET /api/trial-balance/periods
  * @desc Get available periods from trial_balance table
@@ -381,10 +334,24 @@ app.get('/api/trial-balance/data', (req, res) => __awaiter(void 0, void 0, void 
  * @route GET /api/financial-variables
  * @desc Get financial variables data
  */
-app.get('/api/financial-variables1', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+app.get('/api/financial-variables', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
-        const result = yield pool.query('SELECT * FROM financial_variables1');
-        res.json(result.rows);
+        // Check if the table exists first
+        const tableExists = yield pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_name = 'financial_variables1'
+      );
+    `);
+        if (tableExists.rows[0].exists) {
+            const result = yield pool.query('SELECT * FROM financial_variables1');
+            res.json(result.rows);
+        }
+        else {
+            // Return empty array if table doesn't exist
+            console.log('financial_variables1 table does not exist, returning empty array');
+            res.json([]);
+        }
     }
     catch (err) {
         console.error(err.message);

@@ -20,7 +20,7 @@ const pool = new Pool({
   user: process.env.DB_USER || 'postgres',
   host: process.env.DB_HOST || 'localhost',
   database: process.env.DB_DATABASE || 'Y_Finance',
-  password: process.env.DB_PASSWORD || 'password1A',
+  password: process.env.DB_PASSWORD || 'root',
   port: Number(process.env.DB_PORT) || 5432,
 });
 
@@ -117,7 +117,9 @@ async function upsertRowsWithKey(tableName: string, rows: Record<string, any>[])
 
     const updateAssignments = columns
       .filter(col => col !== 'key')
-      .map(col => `"${col}" = EXCLUDED."${col}"`)
+      .map(col => 
+        `"${col}" = COALESCE(${tableName}."${col}", EXCLUDED."${col}")`
+      )
       .join(', ');
 
     const sql = `
@@ -126,6 +128,7 @@ async function upsertRowsWithKey(tableName: string, rows: Record<string, any>[])
       ON CONFLICT ("key")
       DO UPDATE SET ${updateAssignments};
     `;
+
     await pool.query(sql, values);
   }
 }
@@ -305,6 +308,48 @@ app.get('/api/journal/updated', async (req, res) => {
   }
 });
 
+app.post('/update-financial-vars', async (req, res) => {
+  try {
+    const dataArray = Array.isArray(req.body) ? req.body : [req.body];
+
+    for (const row of dataArray) {
+      const { key, ...columnsToUpdate } = row;
+
+      if (!key || Object.keys(columnsToUpdate).length === 0) continue;
+
+      const setClauses = Object.keys(columnsToUpdate)
+        .map((col, i) => `"${col}" = $${i + 2}`)
+        .join(', ');
+
+      const values = [key, ...Object.values(columnsToUpdate)];
+
+      const query = `
+        UPDATE financial_variables1
+        SET ${setClauses}
+        WHERE key = $1
+      `;
+
+      await pool.query(query, values);
+    }
+
+    res.status(200).json({ message: 'Update successful' });
+  } catch (error) {
+    console.error('Error updating:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/financial_variables', async (req, res) => {
+    try {
+        const updatedFinancialVariables = await pool.query('SELECT * FROM financial_variables');
+        const updatedglFinancials = updatedFinancialVariables.rows; // Get all rows directly
+        res.json(updatedglFinancials); // Send all data as JSON
+    } catch (err:any) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+});
+
 /**
  * @route GET /api/trial-balance/periods
  * @desc Get available periods from trial_balance table
@@ -365,7 +410,7 @@ app.get('/api/trial-balance/data', async (req, res) => {
  * @route GET /api/financial-variables
  * @desc Get financial variables data
  */
-app.get('/api/financial-variables', async (req, res) => {
+app.get('/api/financial-variables1', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM financial_variables1');
     res.json(result.rows);
