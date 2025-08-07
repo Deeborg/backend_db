@@ -53,7 +53,7 @@ function ensureTable(tableName, sampleRow) {
     return __awaiter(this, void 0, void 0, function* () {
         const existingColumnsResult = yield pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name = $1`, [tableName]);
         const existingColumns = existingColumnsResult.rows.map(r => r.column_name);
-        const primaryKey = tableName === 'financial_variables1' || 'text_keys1' ? 'key' : 'glAccount';
+        const primaryKey = tableName === 'financial_variables1' ? 'key' : 'glAccount';
         if (existingColumns.length === 0) {
             const columnDefs = Object.keys(sampleRow)
                 .filter(col => col !== primaryKey)
@@ -368,6 +368,17 @@ app.get('/api/financial_variables', (req, res) => __awaiter(void 0, void 0, void
 app.get('/api/text_keys', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const updatedtext_keys = yield pool.query('SELECT * FROM text_keys');
+        const updatedtext_keys1 = updatedtext_keys.rows; // Get all rows directly
+        res.json(updatedtext_keys1); // Send all data as JSON
+    }
+    catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+}));
+app.get('/api/text_keys1', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const updatedtext_keys = yield pool.query('SELECT * FROM text_keys1');
         const updatedtext_keys1 = updatedtext_keys.rows; // Get all rows directly
         res.json(updatedtext_keys1); // Send all data as JSON
     }

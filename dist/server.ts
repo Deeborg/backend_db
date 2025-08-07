@@ -37,7 +37,7 @@ async function ensureTable(tableName: string, sampleRow: Record<string, any>) {
   );
   const existingColumns = existingColumnsResult.rows.map(r => r.column_name);
 
-  const primaryKey = tableName === 'financial_variables1'||'text_keys1' ? 'key' : 'glAccount';
+  const primaryKey = tableName === 'financial_variables1' ? 'key' : 'glAccount';
 
   if (existingColumns.length === 0) {
     const columnDefs = Object.keys(sampleRow)
