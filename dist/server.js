@@ -53,7 +53,7 @@ function ensureTable(tableName, sampleRow) {
     return __awaiter(this, void 0, void 0, function* () {
         const existingColumnsResult = yield pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name = $1`, [tableName]);
         const existingColumns = existingColumnsResult.rows.map(r => r.column_name);
-        const primaryKey = tableName === 'financial_variables1' ? 'key' : 'glAccount';
+        const primaryKey = tableName === 'financial_variables1' || 'text_keys1' ? 'key' : 'glAccount';
         if (existingColumns.length === 0) {
             const columnDefs = Object.keys(sampleRow)
                 .filter(col => col !== primaryKey)
@@ -196,6 +196,21 @@ app.post('/api/financialvar-updated', (req, res) => __awaiter(void 0, void 0, vo
         res.status(500).send('Error inserting/updating data');
     }
 }));
+app.post('/api/text-variables', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const { textVar1 } = req.body;
+    if (!textVar1 || textVar1.length === 0) {
+        return res.status(400).send('No data received');
+    }
+    try {
+        yield ensureTable('text_keys1', textVar1[0]);
+        yield upsertRowsWithKey('text_keys1', textVar1);
+        res.status(200).send('textVar inserted/updated successfully');
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).send('Error inserting/updating data');
+    }
+}));
 /**
  * @route GET /api/journal/metadata
  * @desc  Get GL accounts and period column headers
@@ -289,7 +304,7 @@ app.get('/api/journal/updated', (req, res) => __awaiter(void 0, void 0, void 0, 
         res.status(500).send('Server Error');
     }
 }));
-app.post('/update-financial-vars', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+app.post('/api/update-financial-vars', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const dataArray = Array.isArray(req.body) ? req.body : [req.body];
         for (const row of dataArray) {
@@ -314,11 +329,47 @@ app.post('/update-financial-vars', (req, res) => __awaiter(void 0, void 0, void 
         res.status(500).json({ error: 'Internal server error' });
     }
 }));
+app.post('/api/update-text-vars', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const dataArray = Array.isArray(req.body) ? req.body : [req.body];
+        for (const row of dataArray) {
+            const { key } = row, columnsToUpdate = __rest(row, ["key"]);
+            if (!key || Object.keys(columnsToUpdate).length === 0)
+                continue;
+            const setClauses = Object.keys(columnsToUpdate)
+                .map((col, i) => `"${col}" = $${i + 2}`)
+                .join(', ');
+            const values = [key, ...Object.values(columnsToUpdate)];
+            const query = `
+        UPDATE text_keys1
+        SET ${setClauses}
+        WHERE key = $1
+      `;
+            yield pool.query(query, values);
+        }
+        res.status(200).json({ message: 'Update successful' });
+    }
+    catch (error) {
+        console.error('Error updating:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+}));
 app.get('/api/financial_variables', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const updatedFinancialVariables = yield pool.query('SELECT * FROM financial_variables');
         const updatedglFinancials = updatedFinancialVariables.rows; // Get all rows directly
         res.json(updatedglFinancials); // Send all data as JSON
+    }
+    catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+}));
+app.get('/api/text_keys', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const updatedtext_keys = yield pool.query('SELECT * FROM text_keys');
+        const updatedtext_keys1 = updatedtext_keys.rows; // Get all rows directly
+        res.json(updatedtext_keys1); // Send all data as JSON
     }
     catch (err) {
         console.error(err.message);

@@ -37,7 +37,7 @@ async function ensureTable(tableName: string, sampleRow: Record<string, any>) {
   );
   const existingColumns = existingColumnsResult.rows.map(r => r.column_name);
 
-  const primaryKey = tableName === 'financial_variables1' ? 'key' : 'glAccount';
+  const primaryKey = tableName === 'financial_variables1'||'text_keys1' ? 'key' : 'glAccount';
 
   if (existingColumns.length === 0) {
     const columnDefs = Object.keys(sampleRow)
@@ -106,7 +106,7 @@ async function upsertRows(tableName: string, rows: Record<string, any>[]) {
 
 /**
  * Upsert for financial_variables1
- */
+ */ 
 async function upsertRowsWithKey(tableName: string, rows: Record<string, any>[]) {
   for (const row of rows) {
     const columns = Object.keys(row);
@@ -186,6 +186,22 @@ app.post('/api/financialvar-updated', async (req, res) => {
     await ensureTable('financial_variables1', financialVar1[0]);
     await upsertRowsWithKey('financial_variables1', financialVar1);
     res.status(200).send('financialVar inserted/updated successfully');
+  } catch (error) {
+    console.error(error);
+    res.status(500).send('Error inserting/updating data');
+  }
+});
+
+app.post('/api/text-variables', async (req, res) => {
+  const { textVar1 } = req.body as { textVar1: Record<string, any>[] };
+
+  if (!textVar1 || textVar1.length === 0) {
+    return res.status(400).send('No data received');
+  }
+  try {
+    await ensureTable('text_keys1', textVar1[0]);
+    await upsertRowsWithKey('text_keys1', textVar1);
+    res.status(200).send('textVar inserted/updated successfully');
   } catch (error) {
     console.error(error);
     res.status(500).send('Error inserting/updating data');
@@ -308,7 +324,7 @@ app.get('/api/journal/updated', async (req, res) => {
   }
 });
 
-app.post('/update-financial-vars', async (req, res) => {
+app.post('/api/update-financial-vars', async (req, res) => {
   try {
     const dataArray = Array.isArray(req.body) ? req.body : [req.body];
 
@@ -339,11 +355,62 @@ app.post('/update-financial-vars', async (req, res) => {
   }
 });
 
+app.post('/api/update-text-vars', async (req, res) => {
+  try {
+    const dataArray = Array.isArray(req.body) ? req.body : [req.body];
+
+    for (const row of dataArray) {
+      const { key, ...columnsToUpdate } = row;
+
+      if (!key || Object.keys(columnsToUpdate).length === 0) continue;
+
+      const setClauses = Object.keys(columnsToUpdate)
+        .map((col, i) => `"${col}" = $${i + 2}`)
+        .join(', ');
+
+      const values = [key, ...Object.values(columnsToUpdate)];
+
+      const query = `
+        UPDATE text_keys1
+        SET ${setClauses}
+        WHERE key = $1
+      `;
+
+      await pool.query(query, values);
+    }
+
+    res.status(200).json({ message: 'Update successful' });
+  } catch (error) {
+    console.error('Error updating:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.get('/api/financial_variables', async (req, res) => {
     try {
         const updatedFinancialVariables = await pool.query('SELECT * FROM financial_variables');
         const updatedglFinancials = updatedFinancialVariables.rows; // Get all rows directly
         res.json(updatedglFinancials); // Send all data as JSON
+    } catch (err:any) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+});
+app.get('/api/text_keys', async (req, res) => {
+    try {
+        const updatedtext_keys = await pool.query('SELECT * FROM text_keys');
+        const updatedtext_keys1 = updatedtext_keys.rows; // Get all rows directly
+        res.json(updatedtext_keys1); // Send all data as JSON
+    } catch (err:any) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+});
+app.get('/api/text_keys1', async (req, res) => {
+    try {
+        const updatedtext_keys = await pool.query('SELECT * FROM text_keys1');
+        const updatedtext_keys1 = updatedtext_keys.rows; // Get all rows directly
+        res.json(updatedtext_keys1); // Send all data as JSON
     } catch (err:any) {
         console.error(err.message);
         res.status(500).send('Server Error');
