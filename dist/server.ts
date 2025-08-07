@@ -37,7 +37,7 @@ async function ensureTable(tableName: string, sampleRow: Record<string, any>) {
   );
   const existingColumns = existingColumnsResult.rows.map(r => r.column_name);
 
-  const primaryKey = tableName === 'financial_variables1' ? 'key' : 'glAccount';
+  const primaryKey = (tableName === 'financial_variables1' || tableName === 'text_keys1') ? 'key' : 'glAccount';
 
   if (existingColumns.length === 0) {
     const columnDefs = Object.keys(sampleRow)
@@ -207,7 +207,6 @@ app.post('/api/text-variables', async (req, res) => {
     res.status(500).send('Error inserting/updating data');
   }
 });
-
 /**
  * @route GET /api/journal/metadata
  * @desc  Get GL accounts and period column headers
@@ -235,7 +234,6 @@ app.get('/api/journal/metadata', async (req, res) => {
     res.status(500).send('Server Error');
   }
 });
-
 /**
  * @route POST /api/journal/batch-update
  * @desc Updates multiple journal entries in a single transaction
@@ -286,7 +284,6 @@ app.post('/api/journal/batch-update', async (req, res) => {
     client.release();
   }
 });
-
 /**
  * @route GET /api/journal/entries
  */

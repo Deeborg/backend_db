@@ -53,7 +53,7 @@ function ensureTable(tableName, sampleRow) {
     return __awaiter(this, void 0, void 0, function* () {
         const existingColumnsResult = yield pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name = $1`, [tableName]);
         const existingColumns = existingColumnsResult.rows.map(r => r.column_name);
-        const primaryKey = tableName === 'financial_variables1' ? 'key' : 'glAccount';
+        const primaryKey = (tableName === 'financial_variables1' || tableName === 'text_keys1') ? 'key' : 'glAccount';
         if (existingColumns.length === 0) {
             const columnDefs = Object.keys(sampleRow)
                 .filter(col => col !== primaryKey)
