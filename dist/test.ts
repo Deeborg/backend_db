@@ -4,7 +4,6 @@ import bodyParser from 'body-parser';
 import { Pool } from 'pg';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
-
 dotenv.config();
 
 const app = express();
@@ -83,13 +82,18 @@ export async function ensureTable(
         console.log(`Adding new column ${col} to ${tableName}`); // Debug log
         await pool.query(`ALTER TABLE "${tableName}" ADD COLUMN "${col}" TEXT`);
       } else if (overwrite) {
+
+        if (tableName === 'trial_balance') {
+          console.log(`Delete rows ${col} from adj_entry_list`);
+          // Example: Delete rows from adj_entry_list where period matches column name
+          await pool.query(`DELETE FROM adj_entry_list WHERE period = '${col}'`);
+        }
+
+
         console.log(`Dropping column ${col} from ${tableName}`); // Debug log
         await pool.query(`ALTER TABLE "${tableName}" DROP COLUMN IF EXISTS "${col}"`);
         console.log(`Re-adding column ${col} to ${tableName}`); // Debug log
         await pool.query(`ALTER TABLE "${tableName}" ADD COLUMN "${col}" TEXT`);
-      } else if (renameMap[col]) {
-        console.log(`Renaming column ${col} to ${renameMap[col]} in ${tableName}`); // Debug log
-        await pool.query(`ALTER TABLE "${tableName}" ADD COLUMN "${renameMap[col]}" TEXT`);
       } else {
         console.log(`Duplicate column ${col} found in ${tableName}`); // Debug log
         duplicates.push(col);
@@ -100,7 +104,7 @@ export async function ensureTable(
 }
 
 /**
- * Ensures adj_entry_list table exists with status and approval columns
+ * Ensures adj_entry_list table exists
  */
 async function ensureAdjEntryTable() {
   const createTableSQL = `
@@ -111,31 +115,15 @@ async function ensureAdjEntryTable() {
       "glName" TEXT NOT NULL,
       "period" TEXT NOT NULL,
       "amount" NUMERIC NOT NULL,
+      "narration" TEXT,
       "status" TEXT DEFAULT 'pending',
       "entry_type" TEXT DEFAULT 'manual',
       "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       "approved_at" TIMESTAMP NULL,
       "approved_by" TEXT NULL
-    )
+    );
   `;
   await pool.query(createTableSQL);
-  
-  // // Add new columns if they don't exist (for existing tables)
-  // const alterQueries = [
-  //   `ALTER TABLE adj_entry_list ADD COLUMN IF NOT EXISTS "status" TEXT DEFAULT 'pending'`,
-  //   `ALTER TABLE adj_entry_list ADD COLUMN IF NOT EXISTS "entry_type" TEXT DEFAULT 'manual'`,
-  //   `ALTER TABLE adj_entry_list ADD COLUMN IF NOT EXISTS "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP`,
-  //   `ALTER TABLE adj_entry_list ADD COLUMN IF NOT EXISTS "approved_at" TIMESTAMP NULL`,
-  //   `ALTER TABLE adj_entry_list ADD COLUMN IF NOT EXISTS "approved_by" TEXT NULL`
-  // ];
-  
-  // for (const query of alterQueries) {
-  //   try {
-  //     await pool.query(query);
-  //   } catch (error) {
-  //     console.log('Column may already exist:', error);
-  //   }
-  // }
 }
 ensureAdjEntryTable().catch(console.error);
 
@@ -146,121 +134,95 @@ async function upsertRows(tableName: string, rows: Record<string, any>[]) {
   for (const row of rows) {
     const columns = Object.keys(row);
     const values = Object.values(row);
-    const colNames = columns.map((col) => `"${col}"`).join(', ');
+
+    const colNames = columns.map(col => `"${col}"`).join(', ');
     const paramPlaceholders = columns.map((_, i) => `$${i + 1}`).join(', ');
 
     const updateAssignments = columns
-      .filter((col) => col !== 'glAccount')
-      .map((col) => `"${col}" = EXCLUDED."${col}"`)
+      .filter(col => col !== 'glAccount')
+      .map(col => `"${col}" = EXCLUDED."${col}"`)
       .join(', ');
 
     const sql = `
       INSERT INTO ${tableName} (${colNames})
       VALUES (${paramPlaceholders})
-      ON CONFLICT ("glAccount") DO UPDATE SET ${updateAssignments}
+      ON CONFLICT ("glAccount")
+      DO UPDATE SET ${updateAssignments};
     `;
     await pool.query(sql, values);
   }
 }
 
 /**
- * Upsert for financial_variables1 and text_keys1
+ * Upsert for financial_variables1
  */
 async function upsertRowsWithKey(tableName: string, rows: Record<string, any>[]) {
   for (const row of rows) {
     const columns = Object.keys(row);
     const values = Object.values(row);
-    const colNames = columns.map((col) => `"${col}"`).join(', ');
+
+    const colNames = columns.map(col => `"${col}"`).join(', ');
     const paramPlaceholders = columns.map((_, i) => `$${i + 1}`).join(', ');
 
     const updateAssignments = columns
-      .filter((col) => col !== 'key')
-      .map((col) => `"${col}" = COALESCE(${tableName}."${col}", EXCLUDED."${col}")`)
+      .filter(col => col !== 'key')
+      .map(col =>
+        `"${col}" = COALESCE(${tableName}."${col}", EXCLUDED."${col}")`
+      )
       .join(', ');
 
     const sql = `
       INSERT INTO ${tableName} (${colNames})
       VALUES (${paramPlaceholders})
-      ON CONFLICT ("key") DO UPDATE SET ${updateAssignments}
+      ON CONFLICT ("key")
+      DO UPDATE SET ${updateAssignments};
     `;
+
     await pool.query(sql, values);
   }
 }
 
 /**
  * @route POST /api/data
+ * @desc  Insert mappedData and transformedData into PostgreSQL with upsert
  */
 app.post("/api/data", async (req: Request, res: Response) => {
-  const { mappedData, overwrite, renameMap } = req.body as {
+  const { mappedData, overwrite } = req.body as {
     mappedData: Record<string, any>[];
     overwrite?: boolean;
-    renameMap?: Record<string, string>;
   };
-
-  console.log("Received overwrite flag:", overwrite); // Debug log
-
+  console.log("Received overwrite flag:", overwrite);
   if (!mappedData || mappedData.length === 0) {
-    return res.status(400).send("No data received");
+    return res.status(400).send('No data received');
   }
 
-  const excludeFromDynamicAdjEntryProcessing = [
-    "accountType",
-    "Level 1 Desc",
-    "Level 2 Desc",
-    "functionalArea",
-  ];
+  const exclude = ['accountType', 'Level 1 Desc', 'Level 2 Desc', 'functionalArea'];
 
-  // Transform mappedData to fit adjustment_entries structure
-  const transformedDataForAdjEntries = mappedData.map((row) => {
-    const newRow: Record<string, any> = { glAccount: row.glAccount, glName: row.glName };
+  const transformedData = mappedData.map((row: Record<string, any>) => {
+    const newRow: Record<string, any> = {};
     Object.keys(row).forEach((key) => {
-      if (!excludeFromDynamicAdjEntryProcessing.includes(key) && key !== "glAccount" && key !== "glName") {
-        newRow[key] = row[key] || 0; // Preserve existing values or set to 0
+      if (!exclude.includes(key)) {
+        if (key === 'glAccount' || key === 'glName') {
+          newRow[key] = row[key];
+        } else {
+          newRow[key] = 0;
+        }
       }
     });
     return newRow;
   });
-
-  console.log("Transformed data for adjustment_entries:", transformedDataForAdjEntries[0]); // Debug log
-
   try {
-    // Explicitly drop dynamic columns if overwrite is true
-    if (overwrite) {
-      const existingColumnsResult = await pool.query(
-        `SELECT column_name FROM information_schema.columns WHERE table_name = 'adjustment_entries'`
-      );
-      const existingColumns = existingColumnsResult.rows.map((r) => r.column_name);
-      const excludeFromDynamicManagement = [
-        "glAccount",
-        "glName",
-        "accountType",
-        "Level 1 Desc",
-        "Level 2 Desc",
-        "functionalArea",
-      ];
-
-      for (const col of existingColumns) {
-        if (!excludeFromDynamicManagement.includes(col)) {
-          console.log(`Dropping column ${col} from adjustment_entries`);
-          await pool.query(`ALTER TABLE "adjustment_entries" DROP COLUMN IF EXISTS "${col}"`);
-        }
-      }
-    }
-
     const trialBalanceDuplicates = await ensureTable(
       "trial_balance",
       mappedData[0],
-      overwrite ?? false,
-      renameMap ?? {}
+      overwrite ?? false
     );
 
     const adjustmentEntriesDuplicates = await ensureTable(
       "adjustment_entries",
-      transformedDataForAdjEntries[0],
-      overwrite ?? false,
-      renameMap ?? {}
+      transformedData[0],
+      overwrite ?? false
     );
-
     const allDuplicates: { trial_balance?: string[]; adjustment_entries?: string[] } = {};
     if (trialBalanceDuplicates.length > 0) {
       allDuplicates.trial_balance = trialBalanceDuplicates;
@@ -275,56 +237,29 @@ app.post("/api/data", async (req: Request, res: Response) => {
         duplicates: allDuplicates,
       });
     }
-
-    await upsertRows("trial_balance", mappedData);
-    
-    // Save adjustment entries to adj_entry_list for approval instead of directly to adjustment_entries
-    const hashVal = crypto.randomBytes(8).toString('hex');
-    const client = await pool.connect();
-    
-    try {
-      await client.query('BEGIN');
-      
-      for (const row of transformedDataForAdjEntries) {
-        const { glAccount, glName } = row;
-        
-        // Insert each period as a separate entry for approval
-        for (const [period, amount] of Object.entries(row)) {
-          if (period !== 'glAccount' && period !== 'glName' && amount !== 0 && amount !== '0') {
-            await client.query(
-              `INSERT INTO adj_entry_list (hash_val, "glAccount", "glName", "period", "amount", "status", "entry_type") 
-               VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-              [hashVal, glAccount, glName, period, parseFloat(amount as string) || 0, 'pending', 'excel_upload']
-            );
-          }
-        }
-      }
-      
-      await client.query('COMMIT');
-      client.release();
-      
-      res.status(200).send("Trial balance data inserted successfully. Adjustment entries saved for admin approval.");
-    } catch (err: any) {
-      await client.query('ROLLBACK');
-      client.release();
-      throw err;
-    }
-  } catch (error: any) {
-    console.error("Error in /api/data:", error.message, error.stack);
-    res.status(500).send(error.message || "Error inserting/updating data");
+    await upsertRows('trial_balance', mappedData);
+    await upsertRows('adjustment_entries', transformedData);
+    res.status(200).send('Both mappedData and transformedData inserted/updated successfully');
+  } catch (error) {
+    console.error(error);
+    res.status(500).send('Error inserting/updating data');
   }
 });
 
 /**
- * Financial Variables APIs
+ * @route POST /api/financialvar-updated
  */
 app.post('/api/financialvar-updated', async (req, res) => {
-  const { financialVar1 } = req.body as { financialVar1: Record<string, any>[] };
+  const { financialVar1, overwrite } = req.body as {
+    financialVar1: Record<string, any>[];
+    overwrite?: boolean;
+  };
+
   if (!financialVar1 || financialVar1.length === 0) {
     return res.status(400).send('No data received');
   }
   try {
-    await ensureTable('financial_variables1', financialVar1[0]);
+    await ensureTable('financial_variables1', financialVar1[0], overwrite ?? false);
     await upsertRowsWithKey('financial_variables1', financialVar1);
     res.status(200).send('financialVar inserted/updated successfully');
   } catch (error) {
@@ -334,12 +269,16 @@ app.post('/api/financialvar-updated', async (req, res) => {
 });
 
 app.post('/api/text-variables', async (req, res) => {
-  const { textVar1 } = req.body as { textVar1: Record<string, any>[] };
+  const { textVar1, overwrite } = req.body as {
+    textVar1: Record<string, any>[];
+    overwrite?: boolean;
+  };
+
   if (!textVar1 || textVar1.length === 0) {
     return res.status(400).send('No data received');
   }
   try {
-    await ensureTable('text_keys1', textVar1[0]);
+    await ensureTable('text_keys1', textVar1[0], overwrite ?? false);
     await upsertRowsWithKey('text_keys1', textVar1);
     res.status(200).send('textVar inserted/updated successfully');
   } catch (error) {
@@ -347,9 +286,9 @@ app.post('/api/text-variables', async (req, res) => {
     res.status(500).send('Error inserting/updating data');
   }
 });
-
 /**
- * Journal Metadata & Updates
+ * @route GET /api/journal/metadata
+ * @desc  Get GL accounts and period column headers
  */
 app.get('/api/journal/metadata', async (req, res) => {
   try {
@@ -359,52 +298,58 @@ app.get('/api/journal/metadata', async (req, res) => {
     const glAccounts = glAccountsResult.rows;
 
     const columnsResult = await pool.query(
-      `SELECT column_name FROM information_schema.columns 
-       WHERE table_name = $1 AND column_name NOT IN ('glAccount', 'glName')`,
+      `
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name = $1 AND column_name NOT IN ('glAccount', 'glName')
+      `,
       [TABLE_NAME]
     );
-    const periods = columnsResult.rows.map((row) => row.column_name);
+    const periods = columnsResult.rows.map(row => row.column_name);
 
     res.json({ glAccounts, periods });
-  } catch (err) {
-    console.error('Error fetching metadata:', err);
-    res.status(500).send('Error fetching journal metadata');
+  } catch (err: any) {
+    console.error(err.message);
+    res.status(500).send('Server Error');
   }
 });
-
+/**
+ * @route POST /api/journal/batch-update
+ * @desc Updates multiple journal entries in a single transaction
+ */
 app.post('/api/journal/batch-update', async (req, res) => {
-  const entries = req.body;
+  const { entries, narration } = req.body;
   if (!Array.isArray(entries) || entries.length === 0) {
-    return res
-      .status(400)
-      .json({ msg: 'Invalid request body. Expected an array of entries.' });
+    return res.status(400).json({ msg: 'Invalid request body. Expected an array of entries.' });
   }
-
+  const narrationText = typeof narration === 'string' && narration.trim() !== ''
+    ? narration.trim()
+    : 'No narration provided';
   const client = await pool.connect();
   const hashVal = crypto.randomBytes(8).toString('hex');
 
   try {
     await client.query('BEGIN');
+
     for (const entry of entries) {
       const { glAccount, period, value } = entry;
       if (!glAccount || !period || value === undefined) continue;
 
-      // Get GL Name from adjustment_entries table
       const glRes = await client.query(
         `SELECT "glName" FROM ${TABLE_NAME} WHERE "glAccount" = $1`,
         [glAccount]
       );
       const glName = glRes.rows[0]?.glName || '';
 
-      // Save to adj_entry_list for approval (don't update adjustment_entries yet)
       await client.query(
-        `INSERT INTO adj_entry_list (hash_val, "glAccount", "glName", "period", "amount", "status", "entry_type") 
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [hashVal, glAccount, glName, period, value, 'pending', 'manual']
+        `INSERT INTO adj_entry_list (hash_val, "glAccount", "glName", "period", "amount", "status", "entry_type","narration") 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [hashVal, glAccount, glName, period, value, 'pending', 'manual', narrationText]
       );
     }
+
     await client.query('COMMIT');
-    res.json({ msg: 'Journal entries saved for admin approval', hashVal, status: 'pending' });
+    res.json({ msg: 'Journal entries posted successfully', hashVal });
   } catch (err: any) {
     await client.query('ROLLBACK');
     console.error('Transaction failed:', err.message);
@@ -414,54 +359,10 @@ app.post('/api/journal/batch-update', async (req, res) => {
   }
 });
 
-// Get all pending entries for admin approval
-app.get('/api/journal/pending-entries', async (req, res) => {
-  try {
-    const entriesResult = await pool.query(
-      `SELECT id, hash_val, "glAccount", "glName", "period", "amount", "entry_type", "created_at"
-       FROM adj_entry_list 
-       WHERE "status" = 'pending' 
-       ORDER BY "created_at" DESC, hash_val`
-    );
-    res.json({ entries: entriesResult.rows });
-  } catch (err: any) {
-    console.error(err.message);
-    res.status(500).send('Server Error while fetching pending entries');
-  }
-});
-
-// Approve entries and move them to adjustment_entries
-app.post('/api/journal/approve-entries', async (req: Request, res: Response) => {
- const { entryIds, approvedBy = 'admin', reason = '' } = req.body;
-  
-  if (!Array.isArray(entryIds) || entryIds.length === 0) {
-    return res.status(400).json({ msg: 'Invalid request body. Expected an array of entry IDs.' });
-  }
-
-  try {
-    const placeholders = entryIds.map((_, i) => `$${i + 2}`).join(',');
-    const result = await pool.query(
-      `UPDATE adj_entry_list 
-       SET "status" = 'approved', "approved_at" = CURRENT_TIMESTAMP, "approved_by" = $1
-       WHERE id IN (${placeholders}) `,
-      [approvedBy, ...entryIds]
-    );
-
-    res.json({ 
-      msg: 'Entries approved successfully', 
-      approvedCount: result.rowCount 
-    });
-  } catch (err: any) {
-    console.error('Approve failed:', err.message);
-    res.status(500).send('Server Error during approval process');
-  }
-  
-});
-
 // Reject entries
 app.post('/api/journal/reject-entries', async (req, res) => {
   const { entryIds, rejectedBy = 'admin', reason = '' } = req.body;
-  
+
   if (!Array.isArray(entryIds) || entryIds.length === 0) {
     return res.status(400).json({ msg: 'Invalid request body. Expected an array of entry IDs.' });
   }
@@ -475,9 +376,9 @@ app.post('/api/journal/reject-entries', async (req, res) => {
       [rejectedBy, ...entryIds]
     );
 
-    res.json({ 
-      msg: 'Entries rejected successfully', 
-      rejectedCount: result.rowCount 
+    res.json({
+      msg: 'Entries rejected successfully',
+      rejectedCount: result.rowCount
     });
   } catch (err: any) {
     console.error('Rejection failed:', err.message);
@@ -485,11 +386,101 @@ app.post('/api/journal/reject-entries', async (req, res) => {
   }
 });
 
+// Approve entries
+// app.post('/api/journal/approve-entries', async (req: Request, res: Response) => {
+//   const { entryIds, approvedBy = 'admin', reason = '' } = req.body;
+
+//   if (!Array.isArray(entryIds) || entryIds.length === 0) {
+//     return res.status(400).json({ msg: 'Invalid request body. Expected an array of entry IDs.' });
+//   }
+
+//   try {
+//     const placeholders = entryIds.map((_, i) => `$${i + 2}`).join(',');
+//     const result = await pool.query(
+//       `UPDATE adj_entry_list 
+//        SET "status" = 'approved', "approved_at" = CURRENT_TIMESTAMP, "approved_by" = $1
+//        WHERE id IN (${placeholders}) `,
+//       [approvedBy, ...entryIds]
+//     );
+
+//     res.json({
+//       msg: 'Entries approved successfully',
+//       approvedCount: result.rowCount
+//     });
+//   } catch (err: any) {
+//     console.error('Approve failed:', err.message);
+//     res.status(500).send('Server Error during approval process');
+//   }
+
+// });
+
+app.post('/api/journal/approve-entries', async (req: Request, res: Response) => {
+  const { entryIds, approvedBy = 'admin', reason = '' } = req.body;
+
+  if (!Array.isArray(entryIds) || entryIds.length === 0) {
+    return res.status(400).json({ msg: 'Invalid request body. Expected an array of entry IDs.' });
+  }
+
+  try {
+    // Step 1: Approve entries
+    const placeholders = entryIds.map((_, i) => `$${i + 2}`).join(',');
+    const approveResult = await pool.query(
+      `UPDATE adj_entry_list 
+       SET "status" = 'approved', "approved_at" = CURRENT_TIMESTAMP, "approved_by" = $1
+       WHERE id IN (${placeholders})`,
+      [approvedBy, ...entryIds]
+    );
+
+    // Step 2: Get distinct periods from approved entries
+    const periodsResult = await pool.query(
+      `SELECT DISTINCT period 
+       FROM adj_entry_list
+       WHERE id = ANY($1::int[]) AND status = 'approved'`,
+      [entryIds]
+    );
+
+    const periods = periodsResult.rows.map((r: any) => r.period);
+
+    if (periods.length > 0) {
+      // Step 3: Build dynamic insert/update query for adjustment_entries
+      const insertCols = ['"glAccount"', '"glName"', ...periods.map(p => `"${p}"`)];
+      const selectCols = [
+        '"glAccount"',
+        '"glName"',
+        ...periods.map(p => `SUM(CASE WHEN period = '${p}' THEN amount ELSE 0 END) AS "${p}"`)
+      ];
+      const updateCols = periods.map(p => `"${p}" = EXCLUDED."${p}"`);
+
+      const dynamicQuery = `
+        INSERT INTO adjustment_entries (${insertCols.join(', ')})
+        SELECT ${selectCols.join(', ')}
+        FROM adj_entry_list
+        WHERE id = ANY($1::int[]) AND status = 'approved'
+        GROUP BY "glAccount", "glName"
+        ON CONFLICT ("glAccount") DO UPDATE
+        SET ${updateCols.join(', ')};
+      `;
+
+      await pool.query(dynamicQuery, [entryIds]);
+    }
+
+    res.json({
+      msg: 'Entries approved and adjustment_entries updated successfully',
+      approvedCount: approveResult.rowCount
+    });
+  } catch (err: any) {
+    console.error('Approve failed:', err.message);
+    res.status(500).send('Server Error during approval process');
+  }
+});
+
+
+
 // Get all pending entries for admin approval
 app.get('/api/journal/pending-entries', async (req, res) => {
   try {
     const entriesResult = await pool.query(
-      `SELECT id, hash_val, "glAccount", "glName", "period", "amount", "entry_type", "created_at"
+      `SELECT id, hash_val, "glAccount", "glName", "period", "amount", "entry_type", "created_at","narration"
        FROM adj_entry_list 
        WHERE "status" = 'pending' 
        ORDER BY "created_at" DESC, hash_val`
@@ -500,31 +491,26 @@ app.get('/api/journal/pending-entries', async (req, res) => {
     res.status(500).send('Server Error while fetching pending entries');
   }
 });
-
+/**
+ * @route GET /api/journal/entries
+ */
 app.get('/api/journal/entries', async (req, res) => {
   try {
-    const { period, status } = req.query;
+    const { period } = req.query;
+
     if (!period) {
-      const periodsResult = await pool.query(
-        `SELECT DISTINCT "period" FROM adj_entry_list WHERE "status" = 'approved' ORDER BY "period"`
-      );
-      return res.json({ periods: periodsResult.rows.map((r) => r.period) });
+      const periodsResult = await pool.query(`SELECT DISTINCT "period" FROM adj_entry_list ORDER BY "period"`);
+      return res.json({ periods: periodsResult.rows.map(r => r.period) });
     }
-    
-    let query = `SELECT id, hash_val, "glAccount", "glName", "period", "amount", "status", "entry_type", "created_at", "approved_at", "approved_by"
-                 FROM adj_entry_list WHERE "period" = $1`;
-    let params = [period];
-    
-    if (status) {
-      query += ` AND "status" = $2`;
-      params.push(status as string);
-    } else {
-      query += ` AND "status" = 'approved'`;
-    }
-    
-    query += ` ORDER BY "created_at" DESC, hash_val`;
-    
-    const entriesResult = await pool.query(query, params);
+
+    const entriesResult = await pool.query(
+      `SELECT hash_val, "glAccount", "glName", "period", "amount","narration"
+       FROM adj_entry_list 
+       WHERE "period" = $1 
+       ORDER BY hash_val`,
+      [period]
+    );
+
     res.json({ entries: entriesResult.rows });
   } catch (err: any) {
     console.error(err.message);
@@ -542,22 +528,30 @@ app.get('/api/journal/updated', async (req, res) => {
   }
 });
 
-/**
- * Update APIs
- */
 app.post('/api/update-financial-vars', async (req, res) => {
   try {
     const dataArray = Array.isArray(req.body) ? req.body : [req.body];
+
     for (const row of dataArray) {
       const { key, ...columnsToUpdate } = row;
+
       if (!key || Object.keys(columnsToUpdate).length === 0) continue;
+
       const setClauses = Object.keys(columnsToUpdate)
         .map((col, i) => `"${col}" = $${i + 2}`)
         .join(', ');
+
       const values = [key, ...Object.values(columnsToUpdate)];
-      const query = `UPDATE financial_variables1 SET ${setClauses} WHERE key = $1`;
+
+      const query = `
+        UPDATE financial_variables1
+        SET ${setClauses}
+        WHERE key = $1
+      `;
+
       await pool.query(query, values);
     }
+
     res.status(200).json({ message: 'Update successful' });
   } catch (error) {
     console.error('Error updating:', error);
@@ -568,16 +562,27 @@ app.post('/api/update-financial-vars', async (req, res) => {
 app.post('/api/update-text-vars', async (req, res) => {
   try {
     const dataArray = Array.isArray(req.body) ? req.body : [req.body];
+
     for (const row of dataArray) {
       const { key, ...columnsToUpdate } = row;
+
       if (!key || Object.keys(columnsToUpdate).length === 0) continue;
+
       const setClauses = Object.keys(columnsToUpdate)
         .map((col, i) => `"${col}" = $${i + 2}`)
         .join(', ');
+
       const values = [key, ...Object.values(columnsToUpdate)];
-      const query = `UPDATE text_keys1 SET ${setClauses} WHERE key = $1`;
+
+      const query = `
+        UPDATE text_keys1
+        SET ${setClauses}
+        WHERE key = $1
+      `;
+
       await pool.query(query, values);
     }
+
     res.status(200).json({ message: 'Update successful' });
   } catch (error) {
     console.error('Error updating:', error);
@@ -585,17 +590,11 @@ app.post('/api/update-text-vars', async (req, res) => {
   }
 });
 
-/**
- * Fetch APIs
- */
-
-
-
-
 app.get('/api/text_keys1', async (req, res) => {
   try {
     const updatedtext_keys = await pool.query('SELECT * FROM text_keys1');
-    res.json(updatedtext_keys.rows);
+    const updatedtext_keys1 = updatedtext_keys.rows; // Get all rows directly
+    res.json(updatedtext_keys1); // Send all data as JSON
   } catch (err: any) {
     console.error(err.message);
     res.status(500).send('Server Error');
@@ -603,17 +602,20 @@ app.get('/api/text_keys1', async (req, res) => {
 });
 
 /**
- * Trial Balance APIs
+ * @route GET /api/trial-balance/periods
+ * @desc Get available periods from trial_balance table
  */
 app.get('/api/trial-balance/periods', async (req, res) => {
   try {
-    const columnsResult = await pool.query(
-      `SELECT column_name FROM information_schema.columns 
-       WHERE table_name = 'trial_balance' 
-       AND column_name NOT IN ('glAccount', 'glName', 'accountType', 'Level 1 Desc', 'Level 2 Desc', 'functionalArea')
-       ORDER BY column_name`
-    );
-    const periods = columnsResult.rows.map((row) => row.column_name);
+    const columnsResult = await pool.query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name = 'trial_balance' 
+      AND column_name NOT IN ('glAccount', 'glName', 'accountType', 'Level 1 Desc', 'Level 2 Desc', 'functionalArea')
+      ORDER BY column_name
+    `);
+
+    const periods = columnsResult.rows.map(row => row.column_name);
     res.json({ periods });
   } catch (err: any) {
     console.error(err.message);
@@ -621,18 +623,32 @@ app.get('/api/trial-balance/periods', async (req, res) => {
   }
 });
 
+/**
+ * @route GET /api/trial-balance/data
+ * @desc Get trial balance data for selected periods
+ */
 app.get('/api/trial-balance/data', async (req, res) => {
   try {
-    const { period1, period2 } = req.query as { period1?: string; period2?: string };
+    const { period1, period2 } = req.query;
+
     if (!period1 || !period2) {
       return res.status(400).json({ error: 'Both period1 and period2 are required' });
     }
+
     const query = `
-      SELECT "glAccount", "glName", "accountType", "Level 1 Desc", "Level 2 Desc", "functionalArea",
-             "${period1}" as "amountCurrent", "${period2}" as "amountPrevious"
-      FROM trial_balance
+      SELECT 
+        "glAccount",
+        "glName", 
+        "accountType",
+        "Level 1 Desc",
+        "Level 2 Desc",
+        "functionalArea",
+        "${period1}" as "amountCurrent",
+        "${period2}" as "amountPrevious"
+      FROM trial_balance 
       ORDER BY "glAccount"
     `;
+
     const result = await pool.query(query);
     res.json(result.rows);
   } catch (err: any) {
@@ -642,7 +658,8 @@ app.get('/api/trial-balance/data', async (req, res) => {
 });
 
 /**
- * Financial Variables (v1)
+ * @route GET /api/financial-variables
+ * @desc Get financial variables data
  */
 app.get('/api/financial-variables1', async (req, res) => {
   try {
@@ -654,7 +671,5 @@ app.get('/api/financial-variables1', async (req, res) => {
   }
 });
 
-// --- Start Server ---
-app.listen(PORT, () =>
-  console.log(`✅ Server running on http://localhost:${PORT}`)
-);
+// Start server
+app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));

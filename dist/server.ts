@@ -23,12 +23,10 @@ const pool = new Pool({
   port: Number(process.env.DB_PORT) || 5432,
 });
 
-// --- TABLE NAME for journal update APIs ---
+
 const TABLE_NAME = process.env.JOURNAL_TABLE || 'adjustment_entries';
 
-/**
- * Ensures that a table exists with proper primary key
- */
+
 export async function ensureTable(
   tableName: string,
   sampleRow: Record<string, any>,
@@ -120,7 +118,8 @@ async function ensureAdjEntryTable() {
       "entry_type" TEXT DEFAULT 'manual',
       "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       "approved_at" TIMESTAMP NULL,
-      "approved_by" TEXT NULL
+      "approved_by" TEXT NULL,
+      "admin_comments" TEXT NULL
     );
   `;
   await pool.query(createTableSQL);
@@ -187,18 +186,18 @@ async function upsertRowsWithKey(tableName: string, rows: Record<string, any>[])
  * @desc  Insert mappedData and transformedData into PostgreSQL with upsert
  */
 app.post("/api/data", async (req: Request, res: Response) => {
-  const { mappedData, overwrite } = req.body as {
-    mappedData: Record<string, any>[];
+  const { finalMappedData, overwrite } = req.body as {
+    finalMappedData: Record<string, any>[];
     overwrite?: boolean;
   };
   console.log("Received overwrite flag:", overwrite);
-  if (!mappedData || mappedData.length === 0) {
+  if (!finalMappedData || finalMappedData.length === 0) {
     return res.status(400).send('No data received');
   }
 
   const exclude = ['accountType', 'Level 1 Desc', 'Level 2 Desc', 'functionalArea'];
 
-  const transformedData = mappedData.map((row: Record<string, any>) => {
+  const transformedData = finalMappedData.map((row: Record<string, any>) => {
     const newRow: Record<string, any> = {};
     Object.keys(row).forEach((key) => {
       if (!exclude.includes(key)) {
@@ -214,7 +213,7 @@ app.post("/api/data", async (req: Request, res: Response) => {
   try {
     const trialBalanceDuplicates = await ensureTable(
       "trial_balance",
-      mappedData[0],
+      finalMappedData[0],
       overwrite ?? false
     );
 
@@ -237,7 +236,7 @@ app.post("/api/data", async (req: Request, res: Response) => {
         duplicates: allDuplicates,
       });
     }
-    await upsertRows('trial_balance', mappedData);
+    await upsertRows('trial_balance', finalMappedData);
     await upsertRows('adjustment_entries', transformedData);
     res.status(200).send('Both mappedData and transformedData inserted/updated successfully');
   } catch (error) {
@@ -290,6 +289,16 @@ app.post('/api/text-variables', async (req, res) => {
  * @route GET /api/journal/metadata
  * @desc  Get GL accounts and period column headers
  */
+app.get('/api/data', async (req, res) => {
+ try {
+    const data = await pool.query(`SELECT DISTINCT "glAccount", "glName","Level 1 Desc","Level 2 Desc" FROM trial_balance ORDER BY "glAccount"`);
+    const data1 = data.rows; // Get all rows directly
+    res.json(data1); // Send all data as JSON
+  } catch (err: any) {
+    console.error(err.message);
+    res.status(500).send('Server Error');
+  }
+});
 app.get('/api/journal/metadata', async (req, res) => {
   try {
     const glAccountsResult = await pool.query(
@@ -358,22 +367,24 @@ app.post('/api/journal/batch-update', async (req, res) => {
     client.release();
   }
 });
-
 // Reject entries
 app.post('/api/journal/reject-entries', async (req, res) => {
-  const { entryIds, rejectedBy = 'admin', reason = '' } = req.body;
+  const { entryIds, rejectedBy = 'admin',narration } = req.body;
+  const narrationText = typeof narration === 'string' && narration.trim() !== ''
+    ? narration.trim()
+    : 'No narration provided';
 
   if (!Array.isArray(entryIds) || entryIds.length === 0) {
     return res.status(400).json({ msg: 'Invalid request body. Expected an array of entry IDs.' });
   }
 
   try {
-    const placeholders = entryIds.map((_, i) => `$${i + 2}`).join(',');
+    const placeholders = entryIds.map((_, i) => `$${i + 3}`).join(',');
     const result = await pool.query(
       `UPDATE adj_entry_list 
-       SET "status" = 'rejected', "approved_at" = CURRENT_TIMESTAMP, "approved_by" = $1
+       SET "status" = 'rejected', "approved_at" = CURRENT_TIMESTAMP, "approved_by" = $1, "admin_comments" = $2
        WHERE id IN (${placeholders}) AND "status" = 'pending'`,
-      [rejectedBy, ...entryIds]
+      [rejectedBy,narrationText, ...entryIds]
     );
 
     res.json({
@@ -386,36 +397,11 @@ app.post('/api/journal/reject-entries', async (req, res) => {
   }
 });
 
-// Approve entries
-// app.post('/api/journal/approve-entries', async (req: Request, res: Response) => {
-//   const { entryIds, approvedBy = 'admin', reason = '' } = req.body;
-
-//   if (!Array.isArray(entryIds) || entryIds.length === 0) {
-//     return res.status(400).json({ msg: 'Invalid request body. Expected an array of entry IDs.' });
-//   }
-
-//   try {
-//     const placeholders = entryIds.map((_, i) => `$${i + 2}`).join(',');
-//     const result = await pool.query(
-//       `UPDATE adj_entry_list 
-//        SET "status" = 'approved', "approved_at" = CURRENT_TIMESTAMP, "approved_by" = $1
-//        WHERE id IN (${placeholders}) `,
-//       [approvedBy, ...entryIds]
-//     );
-
-//     res.json({
-//       msg: 'Entries approved successfully',
-//       approvedCount: result.rowCount
-//     });
-//   } catch (err: any) {
-//     console.error('Approve failed:', err.message);
-//     res.status(500).send('Server Error during approval process');
-//   }
-
-// });
-
 app.post('/api/journal/approve-entries', async (req: Request, res: Response) => {
-  const { entryIds, approvedBy = 'admin', reason = '' } = req.body;
+  const { entryIds, approvedBy = 'admin', narration } = req.body;
+  const narrationText = typeof narration === 'string' && narration.trim() !== ''
+    ? narration.trim()
+    : 'No narration provided';
 
   if (!Array.isArray(entryIds) || entryIds.length === 0) {
     return res.status(400).json({ msg: 'Invalid request body. Expected an array of entry IDs.' });
@@ -423,12 +409,12 @@ app.post('/api/journal/approve-entries', async (req: Request, res: Response) => 
 
   try {
     // Step 1: Approve entries
-    const placeholders = entryIds.map((_, i) => `$${i + 2}`).join(',');
+    const placeholders = entryIds.map((_, i) => `$${i + 3}`).join(',');
     const approveResult = await pool.query(
       `UPDATE adj_entry_list 
-       SET "status" = 'approved', "approved_at" = CURRENT_TIMESTAMP, "approved_by" = $1
+       SET "status" = 'approved', "approved_at" = CURRENT_TIMESTAMP, "approved_by" = $1, "admin_comments" = $2
        WHERE id IN (${placeholders})`,
-      [approvedBy, ...entryIds]
+      [approvedBy,narrationText, ...entryIds]
     );
 
     // Step 2: Get distinct periods from approved entries
@@ -473,8 +459,6 @@ app.post('/api/journal/approve-entries', async (req: Request, res: Response) => 
     res.status(500).send('Server Error during approval process');
   }
 });
-
-
 
 // Get all pending entries for admin approval
 app.get('/api/journal/pending-entries', async (req, res) => {

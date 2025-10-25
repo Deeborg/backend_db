@@ -45,11 +45,7 @@ const pool = new pg_1.Pool({
     password: process.env.DB_PASSWORD || 'root',
     port: Number(process.env.DB_PORT) || 5432,
 });
-// --- TABLE NAME for journal update APIs ---
 const TABLE_NAME = process.env.JOURNAL_TABLE || 'adjustment_entries';
-/**
- * Ensures that a table exists with proper primary key
- */
 function ensureTable(tableName_1, sampleRow_1) {
     return __awaiter(this, arguments, void 0, function* (tableName, sampleRow, overwrite = false, renameMap = {}) {
         const existingColumnsResult = yield pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name = $1`, [tableName]);
@@ -133,7 +129,8 @@ function ensureAdjEntryTable() {
       "entry_type" TEXT DEFAULT 'manual',
       "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       "approved_at" TIMESTAMP NULL,
-      "approved_by" TEXT NULL
+      "approved_by" TEXT NULL,
+      "admin_comments" TEXT NULL
     );
   `;
         yield pool.query(createTableSQL);
@@ -193,13 +190,13 @@ function upsertRowsWithKey(tableName, rows) {
  * @desc  Insert mappedData and transformedData into PostgreSQL with upsert
  */
 app.post("/api/data", (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const { mappedData, overwrite } = req.body;
+    const { finalMappedData, overwrite } = req.body;
     console.log("Received overwrite flag:", overwrite);
-    if (!mappedData || mappedData.length === 0) {
+    if (!finalMappedData || finalMappedData.length === 0) {
         return res.status(400).send('No data received');
     }
     const exclude = ['accountType', 'Level 1 Desc', 'Level 2 Desc', 'functionalArea'];
-    const transformedData = mappedData.map((row) => {
+    const transformedData = finalMappedData.map((row) => {
         const newRow = {};
         Object.keys(row).forEach((key) => {
             if (!exclude.includes(key)) {
@@ -214,7 +211,7 @@ app.post("/api/data", (req, res) => __awaiter(void 0, void 0, void 0, function* 
         return newRow;
     });
     try {
-        const trialBalanceDuplicates = yield ensureTable("trial_balance", mappedData[0], overwrite !== null && overwrite !== void 0 ? overwrite : false);
+        const trialBalanceDuplicates = yield ensureTable("trial_balance", finalMappedData[0], overwrite !== null && overwrite !== void 0 ? overwrite : false);
         const adjustmentEntriesDuplicates = yield ensureTable("adjustment_entries", transformedData[0], overwrite !== null && overwrite !== void 0 ? overwrite : false);
         const allDuplicates = {};
         if (trialBalanceDuplicates.length > 0) {
@@ -229,7 +226,7 @@ app.post("/api/data", (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 duplicates: allDuplicates,
             });
         }
-        yield upsertRows('trial_balance', mappedData);
+        yield upsertRows('trial_balance', finalMappedData);
         yield upsertRows('adjustment_entries', transformedData);
         res.status(200).send('Both mappedData and transformedData inserted/updated successfully');
     }
@@ -275,6 +272,17 @@ app.post('/api/text-variables', (req, res) => __awaiter(void 0, void 0, void 0, 
  * @route GET /api/journal/metadata
  * @desc  Get GL accounts and period column headers
  */
+app.get('/api/data', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const data = yield pool.query(`SELECT DISTINCT "glAccount", "glName","Level 1 Desc","Level 2 Desc" FROM trial_balance ORDER BY "glAccount"`);
+        const data1 = data.rows; // Get all rows directly
+        res.json(data1); // Send all data as JSON
+    }
+    catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+}));
 app.get('/api/journal/metadata', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const glAccountsResult = yield pool.query(`SELECT DISTINCT "glAccount", "glName" FROM ${TABLE_NAME} ORDER BY "glAccount"`);
@@ -332,15 +340,18 @@ app.post('/api/journal/batch-update', (req, res) => __awaiter(void 0, void 0, vo
 }));
 // Reject entries
 app.post('/api/journal/reject-entries', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const { entryIds, rejectedBy = 'admin', reason = '' } = req.body;
+    const { entryIds, rejectedBy = 'admin', narration } = req.body;
+    const narrationText = typeof narration === 'string' && narration.trim() !== ''
+        ? narration.trim()
+        : 'No narration provided';
     if (!Array.isArray(entryIds) || entryIds.length === 0) {
         return res.status(400).json({ msg: 'Invalid request body. Expected an array of entry IDs.' });
     }
     try {
-        const placeholders = entryIds.map((_, i) => `$${i + 2}`).join(',');
+        const placeholders = entryIds.map((_, i) => `$${i + 3}`).join(',');
         const result = yield pool.query(`UPDATE adj_entry_list 
-       SET "status" = 'rejected', "approved_at" = CURRENT_TIMESTAMP, "approved_by" = $1
-       WHERE id IN (${placeholders}) AND "status" = 'pending'`, [rejectedBy, ...entryIds]);
+       SET "status" = 'rejected', "approved_at" = CURRENT_TIMESTAMP, "approved_by" = $1, "admin_comments" = $2
+       WHERE id IN (${placeholders}) AND "status" = 'pending'`, [rejectedBy, narrationText, ...entryIds]);
         res.json({
             msg: 'Entries rejected successfully',
             rejectedCount: result.rowCount
@@ -351,40 +362,20 @@ app.post('/api/journal/reject-entries', (req, res) => __awaiter(void 0, void 0, 
         res.status(500).send('Server Error during rejection process');
     }
 }));
-// Approve entries
-// app.post('/api/journal/approve-entries', async (req: Request, res: Response) => {
-//   const { entryIds, approvedBy = 'admin', reason = '' } = req.body;
-//   if (!Array.isArray(entryIds) || entryIds.length === 0) {
-//     return res.status(400).json({ msg: 'Invalid request body. Expected an array of entry IDs.' });
-//   }
-//   try {
-//     const placeholders = entryIds.map((_, i) => `$${i + 2}`).join(',');
-//     const result = await pool.query(
-//       `UPDATE adj_entry_list 
-//        SET "status" = 'approved', "approved_at" = CURRENT_TIMESTAMP, "approved_by" = $1
-//        WHERE id IN (${placeholders}) `,
-//       [approvedBy, ...entryIds]
-//     );
-//     res.json({
-//       msg: 'Entries approved successfully',
-//       approvedCount: result.rowCount
-//     });
-//   } catch (err: any) {
-//     console.error('Approve failed:', err.message);
-//     res.status(500).send('Server Error during approval process');
-//   }
-// });
 app.post('/api/journal/approve-entries', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const { entryIds, approvedBy = 'admin', reason = '' } = req.body;
+    const { entryIds, approvedBy = 'admin', narration } = req.body;
+    const narrationText = typeof narration === 'string' && narration.trim() !== ''
+        ? narration.trim()
+        : 'No narration provided';
     if (!Array.isArray(entryIds) || entryIds.length === 0) {
         return res.status(400).json({ msg: 'Invalid request body. Expected an array of entry IDs.' });
     }
     try {
         // Step 1: Approve entries
-        const placeholders = entryIds.map((_, i) => `$${i + 2}`).join(',');
+        const placeholders = entryIds.map((_, i) => `$${i + 3}`).join(',');
         const approveResult = yield pool.query(`UPDATE adj_entry_list 
-       SET "status" = 'approved', "approved_at" = CURRENT_TIMESTAMP, "approved_by" = $1
-       WHERE id IN (${placeholders})`, [approvedBy, ...entryIds]);
+       SET "status" = 'approved', "approved_at" = CURRENT_TIMESTAMP, "approved_by" = $1, "admin_comments" = $2
+       WHERE id IN (${placeholders})`, [approvedBy, narrationText, ...entryIds]);
         // Step 2: Get distinct periods from approved entries
         const periodsResult = yield pool.query(`SELECT DISTINCT period 
        FROM adj_entry_list
