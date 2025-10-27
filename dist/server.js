@@ -24,13 +24,34 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ensureTable = ensureTable;
+const fs_1 = __importDefault(require("fs"));
+const path_1 = __importDefault(require("path"));
+const envPath = path_1.default.resolve(__dirname, '.env');
+if (fs_1.default.existsSync(envPath)) {
+    const envFileContent = fs_1.default.readFileSync(envPath, 'utf8');
+    envFileContent.split('\n').forEach(line => {
+        // This regex handles quotes and comments
+        const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
+        if (match) {
+            const key = match[1];
+            let value = match[2] || '';
+            // Remove quotes from the value
+            value = value.replace(/^['"](.*)['"]$/, '$1').trim();
+            process.env[key] = value;
+        }
+    });
+    console.log('✅ Manually loaded .env file successfully.');
+}
+else {
+    console.error('❌ CRITICAL: .env file not found at path:', envPath);
+}
 const express_1 = __importDefault(require("express"));
 const cors_1 = __importDefault(require("cors"));
 const body_parser_1 = __importDefault(require("body-parser"));
 const pg_1 = require("pg");
-const dotenv_1 = __importDefault(require("dotenv"));
 const crypto_1 = __importDefault(require("crypto"));
-dotenv_1.default.config();
+const bcryptjs_1 = __importDefault(require("bcryptjs"));
+const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
 const app = (0, express_1.default)();
 const PORT = process.env.API_PORT || 5000;
 app.use((0, cors_1.default)());
@@ -45,7 +66,51 @@ const pool = new pg_1.Pool({
     password: process.env.DB_PASSWORD || 'root',
     port: Number(process.env.DB_PORT) || 5432,
 });
+// --- TABLE NAME for journal update APIs ---
 const TABLE_NAME = process.env.JOURNAL_TABLE || 'adjustment_entries';
+function ensureRequiredTables() {
+    return __awaiter(this, void 0, void 0, function* () {
+        const adjEntryTableSQL = `
+    CREATE TABLE IF NOT EXISTS adj_entry_list (
+      id SERIAL PRIMARY KEY,
+      hash_val TEXT NOT NULL,
+      "glAccount" TEXT NOT NULL,
+      "glName" TEXT NOT NULL,
+      "period" TEXT NOT NULL,
+      "amount" NUMERIC NOT NULL,
+      "narration" TEXT,
+      "status" TEXT DEFAULT 'pending',
+      "entry_type" TEXT DEFAULT 'manual',
+      "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      "approved_at" TIMESTAMP NULL,
+      "approved_by" TEXT NULL,
+      "admin_comments" TEXT NULL
+    );
+  `;
+        yield pool.query(adjEntryTableSQL);
+        console.log("Checked/Created adj_entry_list table.");
+        // NEW: Create the users table for authentication
+        const usersTableSQL = `
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL, -- This will store the email
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'user', -- Can be 'user' or 'admin'
+      name TEXT,
+      mobile TEXT,   
+      company TEXT,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+  `;
+        yield pool.query(usersTableSQL);
+        console.log("Checked/Created users table.");
+    });
+}
+// Run the setup function on application start
+ensureRequiredTables().catch(console.error);
+/**
+ * Ensures that a table exists with proper primary key
+ */
 function ensureTable(tableName_1, sampleRow_1) {
     return __awaiter(this, arguments, void 0, function* (tableName, sampleRow, overwrite = false, renameMap = {}) {
         const existingColumnsResult = yield pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name = $1`, [tableName]);
@@ -111,32 +176,29 @@ function ensureTable(tableName_1, sampleRow_1) {
         return duplicates;
     });
 }
-/**
- * Ensures adj_entry_list table exists
- */
-function ensureAdjEntryTable() {
-    return __awaiter(this, void 0, void 0, function* () {
-        const createTableSQL = `
-    CREATE TABLE IF NOT EXISTS adj_entry_list (
-      id SERIAL PRIMARY KEY,
-      hash_val TEXT NOT NULL,
-      "glAccount" TEXT NOT NULL,
-      "glName" TEXT NOT NULL,
-      "period" TEXT NOT NULL,
-      "amount" NUMERIC NOT NULL,
-      "narration" TEXT,
-      "status" TEXT DEFAULT 'pending',
-      "entry_type" TEXT DEFAULT 'manual',
-      "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      "approved_at" TIMESTAMP NULL,
-      "approved_by" TEXT NULL,
-      "admin_comments" TEXT NULL
-    );
-  `;
-        yield pool.query(createTableSQL);
-    });
-}
-ensureAdjEntryTable().catch(console.error);
+// /**
+//  * Ensures adj_entry_list table exists
+//  */
+// async function ensureAdjEntryTable() {
+//   const createTableSQL = `
+//     CREATE TABLE IF NOT EXISTS adj_entry_list (
+//       id SERIAL PRIMARY KEY,
+//       hash_val TEXT NOT NULL,
+//       "glAccount" TEXT NOT NULL,
+//       "glName" TEXT NOT NULL,
+//       "period" TEXT NOT NULL,
+//       "amount" NUMERIC NOT NULL,
+//       "narration" TEXT,
+//       "status" TEXT DEFAULT 'pending',
+//       "entry_type" TEXT DEFAULT 'manual',
+//       "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+//       "approved_at" TIMESTAMP NULL,
+//       "approved_by" TEXT NULL
+//     );
+//   `;
+//   await pool.query(createTableSQL);
+// }
+// ensureAdjEntryTable().catch(console.error);
 /**
  * Upsert for glAccount based tables
  */
@@ -235,6 +297,17 @@ app.post("/api/data", (req, res) => __awaiter(void 0, void 0, void 0, function* 
         res.status(500).send('Error inserting/updating data');
     }
 }));
+app.get('/api/data', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const data = yield pool.query(`SELECT DISTINCT "glAccount", "glName","Level 1 Desc","Level 2 Desc" FROM trial_balance ORDER BY "glAccount"`);
+        const data1 = data.rows; // Get all rows directly
+        res.json(data1); // Send all data as JSON
+    }
+    catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server Error');
+    }
+}));
 /**
  * @route POST /api/financialvar-updated
  */
@@ -272,17 +345,6 @@ app.post('/api/text-variables', (req, res) => __awaiter(void 0, void 0, void 0, 
  * @route GET /api/journal/metadata
  * @desc  Get GL accounts and period column headers
  */
-app.get('/api/data', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    try {
-        const data = yield pool.query(`SELECT DISTINCT "glAccount", "glName","Level 1 Desc","Level 2 Desc" FROM trial_balance ORDER BY "glAccount"`);
-        const data1 = data.rows; // Get all rows directly
-        res.json(data1); // Send all data as JSON
-    }
-    catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
-    }
-}));
 app.get('/api/journal/metadata', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const glAccountsResult = yield pool.query(`SELECT DISTINCT "glAccount", "glName" FROM ${TABLE_NAME} ORDER BY "glAccount"`);
@@ -581,6 +643,106 @@ app.get('/api/financial-variables1', (req, res) => __awaiter(void 0, void 0, voi
     catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
+    }
+}));
+/**
+ * @route POST /api/auth/register
+ * @desc  Register a new user
+ */
+app.post('/api/auth/register', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    console.log("--- Received request to /api/auth/register ---");
+    console.log("Request Body:", req.body);
+    const { name, email, password, mobile, company, role = 'user' } = req.body;
+    const username = email; // We use email as the unique identifier
+    if (!username || !password || !name) {
+        return res.status(400).json({ msg: 'Please provide name, email, and password.' });
+    }
+    if (role !== 'user' && role !== 'admin') {
+        return res.status(400).json({ msg: 'Invalid role specified.' });
+    }
+    try {
+        console.log(`Checking if user '${username}' already exists...`);
+        const userExists = yield pool.query('SELECT * FROM users WHERE username = $1', [username]);
+        if (userExists.rows.length > 0) {
+            console.warn(`Registration failed: User '${username}' already exists.`);
+            return res.status(409).json({ msg: 'A user with this email already exists.' });
+        }
+        console.log(`User '${username}' does not exist. Proceeding with registration.`);
+        console.log("Hashing password...");
+        const salt = yield bcryptjs_1.default.genSalt(10);
+        const password_hash = yield bcryptjs_1.default.hash(password, salt);
+        console.log("Password hashed successfully.");
+        // Make the very first user an admin by default
+        const userCountResult = yield pool.query('SELECT COUNT(*) FROM users', []);
+        const role = parseInt(userCountResult.rows[0].count, 10) === 0 ? 'admin' : 'user';
+        console.log("Attempting to insert new user into the database...");
+        const insertQuery = `
+    INSERT INTO users (username, password_hash, role, name, mobile, company) 
+    VALUES ($1, $2, $3, $4, $5, $6) 
+    RETURNING id
+`;
+        // This is the array that was missing. It provides the actual values.
+        const values = [
+            username,
+            password_hash,
+            role,
+            name,
+            mobile,
+            company
+        ];
+        const newUserResult = yield pool.query(insertQuery, values);
+        console.log("SUCCESS: New user inserted with ID:", newUserResult.rows[0].id);
+        res.status(201).json({ msg: 'Registration successful! You can now log in.' });
+    }
+    catch (err) {
+        console.error(err.message);
+        res.status(500).send('Server Error during registration');
+    }
+}));
+/**
+ * @route POST /api/auth/login
+ * @desc  Authenticate a user and return a token
+ */
+app.post('/api/auth/login', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const jwtSecret = process.env.JWT_SECRET;
+    if (!jwtSecret) {
+        console.error("!!!!!!!!!! FATAL ERROR !!!!!!!!!!");
+        console.error("JWT_SECRET is not defined in the environment variables.");
+        console.error("Please ensure the .env file is correctly formatted and loaded.");
+        return res.status(500).send('Server configuration error: Missing JWT secret.');
+    }
+    console.log("\n--- Received request to /api/auth/login ---");
+    console.log("Request Body:", req.body);
+    const { username, password } = req.body; // Frontend sends email as username
+    if (!username || !password) {
+        console.error("Login failed: Missing username or password.");
+        return res.status(400).json({ msg: 'Please provide email and password.' });
+    }
+    try {
+        console.log(`Searching for user: '${username}' in the database...`);
+        const result = yield pool.query('SELECT * FROM users WHERE username = $1', [username]);
+        const user = result.rows[0];
+        if (!user) {
+            console.warn(`Login failed: User '${username}' not found.`);
+            return res.status(401).json({ msg: 'Invalid username or password.' });
+        }
+        console.log(`User found:`, { id: user.id, username: user.username, role: user.role });
+        console.log("Comparing submitted password with stored hash...");
+        const isMatch = yield bcryptjs_1.default.compare(password, user.password_hash);
+        if (!isMatch) {
+            console.warn(`Login failed: Password does not match for user '${username}'.`);
+            return res.status(401).json({ msg: 'Invalid username or password.' });
+        }
+        console.log("Password is a match!");
+        const payload = { userId: user.id, username: user.username, role: user.role };
+        const token = jsonwebtoken_1.default.sign(payload, jwtSecret, { expiresIn: '8h' });
+        console.log("JWT token created successfully.");
+        console.log("Sending successful login response to client.");
+        res.json({ token, user: { username: user.username, role: user.role } });
+    }
+    catch (err) {
+        console.error("An unexpected error occurred during login:", err.message);
+        res.status(500).send('Server Error during login');
     }
 }));
 // Start server

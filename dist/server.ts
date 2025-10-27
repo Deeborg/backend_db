@@ -1,10 +1,34 @@
+import fs from 'fs';
+import path from 'path';
+
+const envPath = path.resolve(__dirname, '.env');
+if (fs.existsSync(envPath)) {
+  const envFileContent = fs.readFileSync(envPath, 'utf8');
+  envFileContent.split('\n').forEach(line => {
+    // This regex handles quotes and comments
+    const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
+    if (match) {
+      const key = match[1];
+      let value = match[2] || '';
+      // Remove quotes from the value
+      value = value.replace(/^['"](.*)['"]$/, '$1').trim();
+      process.env[key] = value;
+    }
+  });
+  console.log('✅ Manually loaded .env file successfully.');
+} else {
+  console.error('❌ CRITICAL: .env file not found at path:', envPath);
+}
+
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
 import { Pool } from 'pg';
-import dotenv from 'dotenv';
 import crypto from 'crypto';
-dotenv.config();
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+
+
 
 const app = express();
 const PORT = process.env.API_PORT || 5000;
@@ -23,10 +47,52 @@ const pool = new Pool({
   port: Number(process.env.DB_PORT) || 5432,
 });
 
-
+// --- TABLE NAME for journal update APIs ---
 const TABLE_NAME = process.env.JOURNAL_TABLE || 'adjustment_entries';
 
+async function ensureRequiredTables() {
+  const adjEntryTableSQL = `
+    CREATE TABLE IF NOT EXISTS adj_entry_list (
+      id SERIAL PRIMARY KEY,
+      hash_val TEXT NOT NULL,
+      "glAccount" TEXT NOT NULL,
+      "glName" TEXT NOT NULL,
+      "period" TEXT NOT NULL,
+      "amount" NUMERIC NOT NULL,
+      "narration" TEXT,
+      "status" TEXT DEFAULT 'pending',
+      "entry_type" TEXT DEFAULT 'manual',
+      "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      "approved_at" TIMESTAMP NULL,
+      "approved_by" TEXT NULL,
+      "admin_comments" TEXT NULL
+    );
+  `;
+  await pool.query(adjEntryTableSQL);
+  console.log("Checked/Created adj_entry_list table.");
 
+  // NEW: Create the users table for authentication
+  const usersTableSQL = `
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL, -- This will store the email
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'user', -- Can be 'user' or 'admin'
+      name TEXT,
+      mobile TEXT,   
+      company TEXT,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+  `;
+  await pool.query(usersTableSQL);
+  console.log("Checked/Created users table.");
+}
+// Run the setup function on application start
+ensureRequiredTables().catch(console.error);
+
+/**
+ * Ensures that a table exists with proper primary key
+ */
 export async function ensureTable(
   tableName: string,
   sampleRow: Record<string, any>,
@@ -101,30 +167,31 @@ export async function ensureTable(
   return duplicates;
 }
 
-/**
- * Ensures adj_entry_list table exists
- */
-async function ensureAdjEntryTable() {
-  const createTableSQL = `
-    CREATE TABLE IF NOT EXISTS adj_entry_list (
-      id SERIAL PRIMARY KEY,
-      hash_val TEXT NOT NULL,
-      "glAccount" TEXT NOT NULL,
-      "glName" TEXT NOT NULL,
-      "period" TEXT NOT NULL,
-      "amount" NUMERIC NOT NULL,
-      "narration" TEXT,
-      "status" TEXT DEFAULT 'pending',
-      "entry_type" TEXT DEFAULT 'manual',
-      "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      "approved_at" TIMESTAMP NULL,
-      "approved_by" TEXT NULL,
-      "admin_comments" TEXT NULL
-    );
-  `;
-  await pool.query(createTableSQL);
-}
-ensureAdjEntryTable().catch(console.error);
+// /**
+//  * Ensures adj_entry_list table exists
+//  */
+// async function ensureAdjEntryTable() {
+//   const createTableSQL = `
+//     CREATE TABLE IF NOT EXISTS adj_entry_list (
+//       id SERIAL PRIMARY KEY,
+//       hash_val TEXT NOT NULL,
+//       "glAccount" TEXT NOT NULL,
+//       "glName" TEXT NOT NULL,
+//       "period" TEXT NOT NULL,
+//       "amount" NUMERIC NOT NULL,
+//       "narration" TEXT,
+//       "status" TEXT DEFAULT 'pending',
+//       "entry_type" TEXT DEFAULT 'manual',
+//       "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+//       "approved_at" TIMESTAMP NULL,
+//       "approved_by" TEXT NULL
+//     );
+//   `;
+//   await pool.query(createTableSQL);
+// }
+// ensureAdjEntryTable().catch(console.error);
+
+
 
 /**
  * Upsert for glAccount based tables
@@ -180,6 +247,8 @@ async function upsertRowsWithKey(tableName: string, rows: Record<string, any>[])
     await pool.query(sql, values);
   }
 }
+
+
 
 /**
  * @route POST /api/data
@@ -245,6 +314,16 @@ app.post("/api/data", async (req: Request, res: Response) => {
   }
 });
 
+app.get('/api/data', async (req, res) => {
+ try {
+    const data = await pool.query(`SELECT DISTINCT "glAccount", "glName","Level 1 Desc","Level 2 Desc" FROM trial_balance ORDER BY "glAccount"`);
+    const data1 = data.rows; // Get all rows directly
+    res.json(data1); // Send all data as JSON
+  } catch (err: any) {
+    console.error(err.message);
+    res.status(500).send('Server Error');
+  }
+});
 /**
  * @route POST /api/financialvar-updated
  */
@@ -289,16 +368,6 @@ app.post('/api/text-variables', async (req, res) => {
  * @route GET /api/journal/metadata
  * @desc  Get GL accounts and period column headers
  */
-app.get('/api/data', async (req, res) => {
- try {
-    const data = await pool.query(`SELECT DISTINCT "glAccount", "glName","Level 1 Desc","Level 2 Desc" FROM trial_balance ORDER BY "glAccount"`);
-    const data1 = data.rows; // Get all rows directly
-    res.json(data1); // Send all data as JSON
-  } catch (err: any) {
-    console.error(err.message);
-    res.status(500).send('Server Error');
-  }
-});
 app.get('/api/journal/metadata', async (req, res) => {
   try {
     const glAccountsResult = await pool.query(
@@ -367,6 +436,7 @@ app.post('/api/journal/batch-update', async (req, res) => {
     client.release();
   }
 });
+
 // Reject entries
 app.post('/api/journal/reject-entries', async (req, res) => {
   const { entryIds, rejectedBy = 'admin',narration } = req.body;
@@ -396,6 +466,7 @@ app.post('/api/journal/reject-entries', async (req, res) => {
     res.status(500).send('Server Error during rejection process');
   }
 });
+
 
 app.post('/api/journal/approve-entries', async (req: Request, res: Response) => {
   const { entryIds, approvedBy = 'admin', narration } = req.body;
@@ -459,6 +530,8 @@ app.post('/api/journal/approve-entries', async (req: Request, res: Response) => 
     res.status(500).send('Server Error during approval process');
   }
 });
+
+
 
 // Get all pending entries for admin approval
 app.get('/api/journal/pending-entries', async (req, res) => {
@@ -653,6 +726,124 @@ app.get('/api/financial-variables1', async (req, res) => {
     console.error(err.message);
     res.status(500).send('Server Error');
   }
+});
+
+/**
+ * @route POST /api/auth/register
+ * @desc  Register a new user
+ */
+app.post('/api/auth/register', async (req: Request, res: Response) => {
+
+    console.log("--- Received request to /api/auth/register ---");
+    console.log("Request Body:", req.body);
+    const { name, email, password, mobile, company,role = 'user' } = req.body;
+    const username = email; // We use email as the unique identifier
+
+    if (!username || !password || !name) {
+        return res.status(400).json({ msg: 'Please provide name, email, and password.' });
+    }
+
+    if (role !== 'user' && role !== 'admin') {
+        return res.status(400).json({ msg: 'Invalid role specified.' });
+    }
+
+    try {
+        console.log(`Checking if user '${username}' already exists...`);
+        const userExists = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+        if (userExists.rows.length > 0) {
+            console.warn(`Registration failed: User '${username}' already exists.`);
+            return res.status(409).json({ msg: 'A user with this email already exists.' });
+        }
+        console.log(`User '${username}' does not exist. Proceeding with registration.`);
+        console.log("Hashing password...");
+
+        const salt = await bcrypt.genSalt(10);
+        const password_hash = await bcrypt.hash(password, salt);
+        console.log("Password hashed successfully.");
+        // Make the very first user an admin by default
+        const userCountResult = await pool.query('SELECT COUNT(*) FROM users', []);
+        const role = parseInt(userCountResult.rows[0].count, 10) === 0 ? 'admin' : 'user';
+
+        console.log("Attempting to insert new user into the database...");
+const insertQuery = `
+    INSERT INTO users (username, password_hash, role, name, mobile, company) 
+    VALUES ($1, $2, $3, $4, $5, $6) 
+    RETURNING id
+`;
+
+// This is the array that was missing. It provides the actual values.
+const values = [
+    username,
+    password_hash,
+    role,
+    name,
+    mobile,
+    company
+];
+
+const newUserResult = await pool.query(insertQuery, values);
+
+console.log("SUCCESS: New user inserted with ID:", newUserResult.rows[0].id);
+
+res.status(201).json({ msg: 'Registration successful! You can now log in.' });
+    } catch (err: any) {
+        console.error(err.message);
+        res.status(500).send('Server Error during registration');
+    }
+});
+
+/**
+ * @route POST /api/auth/login
+ * @desc  Authenticate a user and return a token
+ */
+app.post('/api/auth/login', async (req: Request, res: Response) => {
+
+    const jwtSecret = process.env.JWT_SECRET;
+    if (!jwtSecret) {
+        console.error("!!!!!!!!!! FATAL ERROR !!!!!!!!!!");
+        console.error("JWT_SECRET is not defined in the environment variables.");
+        console.error("Please ensure the .env file is correctly formatted and loaded.");
+        return res.status(500).send('Server configuration error: Missing JWT secret.');
+    }
+
+    console.log("\n--- Received request to /api/auth/login ---");
+    console.log("Request Body:", req.body);
+    const { username, password } = req.body; // Frontend sends email as username
+
+    if (!username || !password) {
+        console.error("Login failed: Missing username or password.");
+        return res.status(400).json({ msg: 'Please provide email and password.' });
+    }
+
+    try {
+        console.log(`Searching for user: '${username}' in the database...`);
+        const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+        const user = result.rows[0];
+
+        if (!user) {
+            console.warn(`Login failed: User '${username}' not found.`);
+            return res.status(401).json({ msg: 'Invalid username or password.' });
+        }
+        console.log(`User found:`, { id: user.id, username: user.username, role: user.role });
+        console.log("Comparing submitted password with stored hash...");
+        const isMatch = await bcrypt.compare(password, user.password_hash);
+        if (!isMatch) {
+            console.warn(`Login failed: Password does not match for user '${username}'.`);
+            return res.status(401).json({ msg: 'Invalid username or password.' });
+        }
+        console.log("Password is a match!");
+        const payload = { userId: user.id, username: user.username, role: user.role };
+
+        const token = jwt.sign(payload, jwtSecret, { expiresIn: '8h' });
+         console.log("JWT token created successfully.");
+
+        console.log("Sending successful login response to client.");
+        res.json({ token, user: { username: user.username, role: user.role } });
+
+    } catch (err: any) {
+        console.error("An unexpected error occurred during login:", err.message);
+        res.status(500).send('Server Error during login');
+    }
 });
 
 // Start server
