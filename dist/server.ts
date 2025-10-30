@@ -62,9 +62,12 @@ async function ensureRequiredTables() {
       "narration" TEXT,
       "status" TEXT DEFAULT 'pending',
       "entry_type" TEXT DEFAULT 'manual',
+      "created_by" TEXT NULL,
       "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       "approved_at" TIMESTAMP NULL,
       "approved_by" TEXT NULL,
+      "rejected_by"TEXT NULL,
+      "rejected_at"  TIMESTAMP NULL,
       "admin_comments" TEXT NULL
     );
   `;
@@ -77,7 +80,7 @@ async function ensureRequiredTables() {
       id SERIAL PRIMARY KEY,
       username TEXT UNIQUE NOT NULL, -- This will store the email
       password_hash TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'user', -- Can be 'user' or 'admin'
+      role TEXT NOT NULL , -- Can be 'user' or 'admin'
       name TEXT,
       mobile TEXT,   
       company TEXT,
@@ -86,6 +89,19 @@ async function ensureRequiredTables() {
   `;
   await pool.query(usersTableSQL);
   console.log("Checked/Created users table.");
+
+    const noteStatusTableSQL = `
+    CREATE TABLE IF NOT EXISTS note_edit_status (
+      id SERIAL PRIMARY KEY,
+      note_number TEXT NOT NULL,
+      period_key TEXT NOT NULL,
+      is_edited BOOLEAN DEFAULT FALSE,
+      last_edited_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(note_number, period_key)
+    );
+  `;
+  await pool.query(noteStatusTableSQL);
+  console.log("Checked/Created note_edit_status table.");
 }
 // Run the setup function on application start
 ensureRequiredTables().catch(console.error);
@@ -396,7 +412,7 @@ app.get('/api/journal/metadata', async (req, res) => {
  * @desc Updates multiple journal entries in a single transaction
  */
 app.post('/api/journal/batch-update', async (req, res) => {
-  const { entries, narration } = req.body;
+  const { entries, narration, createdBy } = req.body;
   if (!Array.isArray(entries) || entries.length === 0) {
     return res.status(400).json({ msg: 'Invalid request body. Expected an array of entries.' });
   }
@@ -420,9 +436,50 @@ app.post('/api/journal/batch-update', async (req, res) => {
       const glName = glRes.rows[0]?.glName || '';
 
       await client.query(
-        `INSERT INTO adj_entry_list (hash_val, "glAccount", "glName", "period", "amount", "status", "entry_type","narration") 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [hashVal, glAccount, glName, period, value, 'pending', 'manual', narrationText]
+        `INSERT INTO adj_entry_list (hash_val, "glAccount", "glName", "period", "amount", "status", "entry_type","narration", "created_by")
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [hashVal, glAccount, glName, period, value, 'pending', 'manual', narrationText,createdBy]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ msg: 'Journal entries posted successfully', hashVal });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    console.error('Transaction failed:', err.message);
+    res.status(500).send('Server Error during transaction');
+  } finally {
+    client.release();
+  }
+});app.post('/api/journal/batch-update', async (req, res) => {
+  const { entries, narration, createdBy } = req.body;
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return res.status(400).json({ msg: 'Invalid request body. Expected an array of entries.' });
+  }
+  const narrationText = typeof narration === 'string' && narration.trim() !== ''
+    ? narration.trim()
+    : 'No narration provided';
+  const client = await pool.connect();
+  const hashVal = crypto.randomBytes(8).toString('hex');
+
+  try {
+    await client.query('BEGIN');
+
+    for (const entry of entries) {
+      const { glAccount, period, value } = entry;
+      if (!glAccount || !period || value === undefined) continue;
+
+      const glRes = await client.query(
+        `SELECT "glName" FROM ${TABLE_NAME} WHERE "glAccount" = $1`,
+        [glAccount]
+      );
+      const glName = glRes.rows[0]?.glName || '';
+
+      // FIX 2: Removed extra closing parenthesis before VALUES
+      await client.query(
+        `INSERT INTO adj_entry_list (hash_val, "glAccount", "glName", "period", "amount", "status", "entry_type", "narration", "created_by") 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [hashVal, glAccount, glName, period, value, 'pending', 'manual', narrationText, createdBy]
       );
     }
 
@@ -438,6 +495,46 @@ app.post('/api/journal/batch-update', async (req, res) => {
 });
 
 // Reject entries
+
+
+app.get('/api/journal/entries', async (req, res) => {
+  try {
+    const { period, user } = req.query;
+
+    if (!period) {
+      const periodsResult = await pool.query(`SELECT DISTINCT "period" FROM adj_entry_list ORDER BY "period"`);
+      return res.json({ periods: periodsResult.rows.map(r => r.period) });
+    }
+
+    // FIX 1: Expanded the SELECT statement to include all necessary status columns.
+    let queryText = `
+        SELECT 
+            hash_val, "glAccount", "glName", "period", "amount", "narration",
+            "status", "created_by", "approved_by", "approved_at", "rejected_by", 
+            "rejected_at", "admin_comments"
+        FROM adj_entry_list 
+        WHERE "period" = $1
+    `;
+    const queryParams: (string | number)[] = [period as string];
+
+
+    if (user) {
+        queryText += ` AND "created_by" = $2`;
+        queryParams.push(user as string);
+    }
+
+    queryText += ` ORDER BY hash_val, "created_at" DESC`;
+    
+    const entriesResult = await pool.query(queryText, queryParams);
+
+    res.json({ entries: entriesResult.rows });
+
+  } catch (err: any) {
+    console.error(err.message);
+    res.status(500).send('Server Error while fetching entries');
+  }
+});
+
 app.post('/api/journal/reject-entries', async (req, res) => {
   const { entryIds, rejectedBy = 'admin',narration } = req.body;
   const narrationText = typeof narration === 'string' && narration.trim() !== ''
@@ -452,9 +549,9 @@ app.post('/api/journal/reject-entries', async (req, res) => {
     const placeholders = entryIds.map((_, i) => `$${i + 3}`).join(',');
     const result = await pool.query(
       `UPDATE adj_entry_list 
-       SET "status" = 'rejected', "approved_at" = CURRENT_TIMESTAMP, "approved_by" = $1, "admin_comments" = $2
+       SET "status" = 'rejected', "rejected_at" = CURRENT_TIMESTAMP, "rejected_by" = $1, "admin_comments" = $2
        WHERE id IN (${placeholders}) AND "status" = 'pending'`,
-      [rejectedBy,narrationText, ...entryIds]
+      [rejectedBy, narrationText, ...entryIds]
     );
 
     res.json({
@@ -464,9 +561,8 @@ app.post('/api/journal/reject-entries', async (req, res) => {
   } catch (err: any) {
     console.error('Rejection failed:', err.message);
     res.status(500).send('Server Error during rejection process');
-  }
+  }
 });
-
 
 app.post('/api/journal/approve-entries', async (req: Request, res: Response) => {
   const { entryIds, approvedBy = 'admin', narration } = req.body;
@@ -536,14 +632,14 @@ app.post('/api/journal/approve-entries', async (req: Request, res: Response) => 
 // Get all pending entries for admin approval
 app.get('/api/journal/pending-entries', async (req, res) => {
   try {
-    const entriesResult = await pool.query(
-      `SELECT id, hash_val, "glAccount", "glName", "period", "amount", "entry_type", "created_at","narration"
+   const entriesResult = await pool.query(
+      `SELECT id, hash_val, "glAccount", "glName", "period", "amount", "entry_type", "created_at", "narration", "created_by"
        FROM adj_entry_list 
        WHERE "status" = 'pending' 
        ORDER BY "created_at" DESC, hash_val`
     );
     res.json({ entries: entriesResult.rows });
-  } catch (err: any) {
+  }  catch (err: any) {
     console.error(err.message);
     res.status(500).send('Server Error while fetching pending entries');
   }
@@ -553,23 +649,37 @@ app.get('/api/journal/pending-entries', async (req, res) => {
  */
 app.get('/api/journal/entries', async (req, res) => {
   try {
-    const { period } = req.query;
+    const { period, user } = req.query;
 
     if (!period) {
       const periodsResult = await pool.query(`SELECT DISTINCT "period" FROM adj_entry_list ORDER BY "period"`);
       return res.json({ periods: periodsResult.rows.map(r => r.period) });
     }
 
-    const entriesResult = await pool.query(
-      `SELECT hash_val, "glAccount", "glName", "period", "amount","narration"
-       FROM adj_entry_list 
-       WHERE "period" = $1 
-       ORDER BY hash_val`,
-      [period]
-    );
+let queryText = `
+        SELECT 
+            j.hash_val, j."glAccount", j."glName", j."period", j."amount", j."narration",
+            j."status", j."created_by", u.name as creator_name, j."approved_by", j."approved_at", j."rejected_by", 
+            j."rejected_at", j."admin_comments"
+        FROM adj_entry_list j
+        LEFT JOIN users u ON j.created_by = u.username
+        WHERE j."period" = $1
+    `;
+    const queryParams: (string | number)[] = [period as string];
+
+
+    if (user) {
+        queryText += ` AND j."created_by" = $2`; // Filter by the creator's username/email
+        queryParams.push(user as string);
+    }
+
+    queryText += ` ORDER BY j.hash_val, j."created_at" DESC`;
+    
+    const entriesResult = await pool.query(queryText, queryParams);
 
     res.json({ entries: entriesResult.rows });
-  } catch (err: any) {
+
+  }catch (err: any) {
     console.error(err.message);
     res.status(500).send('Server Error while fetching entries');
   }
@@ -736,14 +846,14 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
 
     console.log("--- Received request to /api/auth/register ---");
     console.log("Request Body:", req.body);
-    const { name, email, password, mobile, company,role = 'user' } = req.body;
+    const { name, email, password, mobile, company,role: requestedRole = 'user' } = req.body;
     const username = email; // We use email as the unique identifier
 
     if (!username || !password || !name) {
         return res.status(400).json({ msg: 'Please provide name, email, and password.' });
     }
 
-    if (role !== 'user' && role !== 'admin') {
+    if (requestedRole !== 'user' && requestedRole !== 'admin') {
         return res.status(400).json({ msg: 'Invalid role specified.' });
     }
 
@@ -761,8 +871,9 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
         const password_hash = await bcrypt.hash(password, salt);
         console.log("Password hashed successfully.");
         // Make the very first user an admin by default
-        const userCountResult = await pool.query('SELECT COUNT(*) FROM users', []);
-        const role = parseInt(userCountResult.rows[0].count, 10) === 0 ? 'admin' : 'user';
+        const userCountResult = await pool.query('SELECT COUNT(*) FROM users');
+        const isFirstUser = parseInt(userCountResult.rows[0].count, 10) === 0;
+         const finalRole = isFirstUser ? 'admin' : requestedRole;
 
         console.log("Attempting to insert new user into the database...");
 const insertQuery = `
@@ -775,7 +886,7 @@ const insertQuery = `
 const values = [
     username,
     password_hash,
-    role,
+     finalRole,
     name,
     mobile,
     company
@@ -843,6 +954,67 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
     } catch (err: any) {
         console.error("An unexpected error occurred during login:", err.message);
         res.status(500).send('Server Error during login');
+    }
+});
+
+app.get('/api/notes/status', async (req: Request, res: Response) => {
+    const { periodKey } = req.query;
+
+    if (!periodKey || typeof periodKey !== 'string') {
+        return res.status(400).json({ msg: 'A periodKey query parameter is required.' });
+    }
+
+    try {
+        const result = await pool.query(
+            'SELECT note_number FROM note_edit_status WHERE period_key = $1 AND is_edited = TRUE',
+            [periodKey]
+        );
+        
+        const editedNotes = result.rows.map(row => row.note_number);
+        res.status(200).json({ editedNotes });
+
+    } catch (err: any) {
+        console.error('Error fetching note statuses:', err.message);
+        res.status(500).send('Server Error');
+    }
+});
+
+app.post('/api/notes/status', async (req: Request, res: Response) => {
+    const { noteNumbers, periodKey } = req.body;
+
+    if (!Array.isArray(noteNumbers) || !periodKey) {
+        return res.status(400).json({ msg: 'Invalid request body. Expected noteNumbers (array) and periodKey (string).' });
+    }
+
+    if (noteNumbers.length === 0) {
+        return res.status(200).json({ msg: 'No notes to update.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        for (const noteNumber of noteNumbers) {
+            const query = `
+                INSERT INTO note_edit_status (note_number, period_key, is_edited, last_edited_at)
+                VALUES ($1, $2, TRUE, CURRENT_TIMESTAMP)
+                ON CONFLICT (note_number, period_key)
+                DO UPDATE SET
+                    is_edited = TRUE,
+                    last_edited_at = CURRENT_TIMESTAMP;
+            `;
+            await client.query(query, [String(noteNumber), periodKey]);
+        }
+
+        await client.query('COMMIT');
+        res.status(200).json({ msg: 'Note statuses updated successfully.' });
+
+    } catch (err: any) {
+        await client.query('ROLLBACK');
+        console.error('Error updating note statuses:', err.message);
+        res.status(500).send('Server Error');
+    } finally {
+        client.release();
     }
 });
 
